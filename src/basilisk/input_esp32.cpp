@@ -5,10 +5,14 @@
  *
  *  Handles:
  *  - Touch panel input (as mouse via M5Unified)
- *  - USB HID keyboard input (via EspUsbHost library)
- *  - USB HID mouse input (via EspUsbHost library)
+ *  - USB HID keyboard input (via ESP-IDF USB Host Library)
+ *  - USB HID mouse input (via ESP-IDF USB Host Library)
  *
  *  USB Host uses USB2 port on M5Stack Tab5
+ *  Supports USB hubs for simultaneous keyboard + mouse
+ *
+ *  Mouse right-click is translated to Control+Click for Mac OS 8
+ *  contextual menu compatibility.
  */
 
 #include "sysdeps.h"
@@ -17,10 +21,18 @@
 #include "video.h"
 
 #include <M5Unified.h>
-#include <EspUsbHost.h>
-#include "esp_attr.h"  // For DRAM_ATTR
+#include <usb/usb_host.h>
+#include <class/hid/hid.h>
+#include "esp_attr.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+
+#ifndef USB_INTERFACE_DESC
+#define USB_INTERFACE_DESC 0x04
+#endif
+#ifndef USB_ENDPOINT_DESC
+#define USB_ENDPOINT_DESC 0x05
+#endif
 
 #define DEBUG 0
 #include "debug.h"
@@ -28,7 +40,7 @@
 // ============================================================================
 // Input Task Configuration (runs on Core 0 to offload CPU emulation)
 // ============================================================================
-#define INPUT_TASK_STACK_SIZE 4096
+#define INPUT_TASK_STACK_SIZE 8192
 #define INPUT_TASK_PRIORITY   1
 #define INPUT_TASK_CORE       0  // Run on Core 0, leaving Core 1 for CPU emulation
 #define INPUT_POLL_INTERVAL_MS 20  // 50Hz polling
@@ -269,299 +281,590 @@ static bool mouse_connected = false;
 // USB mouse button state
 static uint8_t usb_mouse_buttons = 0;
 
+// Right-click to Control+Click translation state (Mac OS 8 contextual menus)
+static bool right_click_ctrl_injected = false;
+
+// Keyboard modifier state bitmask for proper left/right handling
+// Bit 0: Left Control, Bit 1: Left Shift, Bit 2: Left Alt, Bit 3: Left GUI
+// Bit 4: Right Control, Bit 5: Right Shift, Bit 6: Right Alt, Bit 7: Right GUI
+static uint8_t kb_modifier_state = 0;
+
 // LED state tracking
 static uint8_t last_led_state = 0;
 static uint32_t last_led_check_time = 0;
 static const uint32_t LED_CHECK_INTERVAL_MS = 100;  // Check every 100ms
 
 // ============================================================================
+// Multi-Device USB Host Types
+// ============================================================================
+
+#define MAX_USB_DEVICES 4
+#define MAX_TRANSFERS_PER_DEVICE 8
+#define MAX_INTERFACES_PER_DEVICE 8
+#define MAX_ENDPOINTS 17
+
+struct EndpointInfo {
+    uint8_t bInterfaceClass;
+    uint8_t bInterfaceSubClass;
+    uint8_t bInterfaceProtocol;
+};
+
+struct UsbDeviceSlot {
+    bool active;
+    usb_device_handle_t handle;
+    bool has_keyboard;
+    bool has_mouse;
+    usb_transfer_t *transfers[MAX_TRANSFERS_PER_DEVICE];
+    uint8_t transfer_count;
+    uint8_t interfaces[MAX_INTERFACES_PER_DEVICE];
+    uint8_t interface_count;
+    EndpointInfo endpoint_info[MAX_ENDPOINTS];
+    hid_keyboard_report_t last_kb_report;
+    uint8_t interval;
+    bool ready;
+    unsigned long last_poll;
+};
+
 // Forward declarations
-// ============================================================================
-
-class MacUsbHost;
-static MacUsbHost *usbHost = NULL;
+class MultiDeviceUsbHost;
+static MultiDeviceUsbHost *usbHost = NULL;
 
 // ============================================================================
-// MacUsbHost - Custom USB Host class for Mac emulation
+// Keyboard Input Processing
 // ============================================================================
 
-class MacUsbHost : public EspUsbHost {
+static uint8_t getCombinedModifierMask(uint8_t bit) {
+    uint8_t base_bit = bit & 0x03;
+    return (1 << base_bit) | (1 << (base_bit + 4));
+}
+
+// Only sends key down when FIRST of left/right is pressed,
+// only sends key up when BOTH left and right are released.
+static void handleModifierBit(uint8_t bit, bool pressed, uint8_t mac_keycode) {
+    uint8_t mask = (1 << bit);
+    uint8_t combined_mask = getCombinedModifierMask(bit);
+    bool was_pressed = (kb_modifier_state & mask) != 0;
+    bool either_was_pressed = (kb_modifier_state & combined_mask) != 0;
+
+    if (pressed && !was_pressed) {
+        kb_modifier_state |= mask;
+        if (!either_was_pressed) {
+            ADBKeyDown(mac_keycode);
+        }
+    } else if (!pressed && was_pressed) {
+        kb_modifier_state &= ~mask;
+        bool either_still_pressed = (kb_modifier_state & combined_mask) != 0;
+        if (!either_still_pressed) {
+            ADBKeyUp(mac_keycode);
+        }
+    }
+}
+
+static bool isControlPhysicallyHeld() {
+    return (kb_modifier_state & 0x11) != 0;
+}
+
+static void processKeyboardReport(hid_keyboard_report_t *report,
+                                   hid_keyboard_report_t *last_report) {
+    if (!keyboard_enabled) return;
+
+    keyboard_connected = true;
+
+    // Process modifier keys FIRST (important for key chords)
+    handleModifierBit(0, (report->modifier & 0x01) != 0, 0x36);  // Left Control
+    handleModifierBit(1, (report->modifier & 0x02) != 0, 0x38);  // Left Shift
+    handleModifierBit(2, (report->modifier & 0x04) != 0, 0x3A);  // Left Alt/Option
+    handleModifierBit(3, (report->modifier & 0x08) != 0, 0x37);  // Left GUI/Command
+    handleModifierBit(4, (report->modifier & 0x10) != 0, 0x36);  // Right Control
+    handleModifierBit(5, (report->modifier & 0x20) != 0, 0x38);  // Right Shift
+    handleModifierBit(6, (report->modifier & 0x40) != 0, 0x3A);  // Right Alt/Option
+    handleModifierBit(7, (report->modifier & 0x80) != 0, 0x37);  // Right GUI/Command
+
+    // Process key releases BEFORE key presses (important for key transitions)
+    for (int i = 0; i < 6; i++) {
+        uint8_t old_key = last_report->keycode[i];
+        if (old_key == 0) continue;
+
+        bool still_pressed = false;
+        for (int j = 0; j < 6; j++) {
+            if (report->keycode[j] == old_key) {
+                still_pressed = true;
+                break;
+            }
+        }
+
+        if (!still_pressed) {
+            uint8_t mac_code = usb_to_mac_keycode[old_key];
+            if (mac_code != 0xFF) {
+                ADBKeyUp(mac_code);
+            }
+        }
+    }
+
+    // Process key presses
+    for (int i = 0; i < 6; i++) {
+        uint8_t new_key = report->keycode[i];
+        if (new_key == 0) continue;
+
+        bool was_pressed = false;
+        for (int j = 0; j < 6; j++) {
+            if (last_report->keycode[j] == new_key) {
+                was_pressed = true;
+                break;
+            }
+        }
+
+        if (!was_pressed) {
+            uint8_t mac_code = usb_to_mac_keycode[new_key];
+            if (mac_code != 0xFF) {
+                ADBKeyDown(mac_code);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Mouse Input Processing (with Mac OS 8 right-click -> Control+Click)
+// ============================================================================
+
+static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_info) {
+    if (ep_info->bInterfaceClass != USB_CLASS_HID) return;
+    if (ep_info->bInterfaceProtocol == HID_ITF_PROTOCOL_KEYBOARD) return;
+    if (transfer->actual_num_bytes < 3) return;
+
+    mouse_connected = true;
+
+    uint8_t buttons = 0;
+    int16_t dx = 0;
+    int16_t dy = 0;
+
+    // Logitech MX Master and similar mice: Report ID 0x02, 16-bit movement
+    if (transfer->actual_num_bytes >= 7 && transfer->data_buffer[0] == 0x02) {
+        buttons = transfer->data_buffer[1];
+        dx = (int16_t)(transfer->data_buffer[3] | (transfer->data_buffer[4] << 8));
+        dy = (int16_t)(transfer->data_buffer[5] | (transfer->data_buffer[6] << 8));
+    } else if (transfer->actual_num_bytes >= 4 && transfer->data_buffer[0] <= 0x07) {
+        // Standard boot protocol: buttons, X, Y, wheel
+        buttons = transfer->data_buffer[0];
+        dx = (int8_t)transfer->data_buffer[1];
+        dy = (int8_t)transfer->data_buffer[2];
+    } else if (transfer->actual_num_bytes >= 5) {
+        // Report ID format: ReportID, buttons, X, Y
+        buttons = transfer->data_buffer[1];
+        dx = (int8_t)transfer->data_buffer[2];
+        dy = (int8_t)transfer->data_buffer[3];
+    } else {
+        // Fallback: assume boot protocol
+        buttons = transfer->data_buffer[0];
+        dx = (int8_t)transfer->data_buffer[1];
+        dy = (int8_t)transfer->data_buffer[2];
+    }
+
+    uint8_t old_buttons = usb_mouse_buttons;
+
+    // Mac OS 8 right-click -> Control+Click translation.
+    // Inject/release a synthetic Control key when right button changes.
+    bool right_now = (buttons & 0x02) != 0;
+    bool right_was = (old_buttons & 0x02) != 0;
+
+    if (right_now && !right_was) {
+        if (!isControlPhysicallyHeld()) {
+            ADBKeyDown(0x36);  // Control
+            right_click_ctrl_injected = true;
+        }
+    } else if (!right_now && right_was) {
+        if (right_click_ctrl_injected) {
+            ADBKeyUp(0x36);
+            right_click_ctrl_injected = false;
+        }
+    }
+
+    // Mac button 0 maps from USB left (0x01) OR right (0x02).
+    // Both physical buttons drive a single Mac left-click so that
+    // releasing one while the other is still held keeps the button down.
+    bool mac_btn0_now = (buttons & 0x01) || (buttons & 0x02);
+    bool mac_btn0_was = (old_buttons & 0x01) || (old_buttons & 0x02);
+
+    if (mac_btn0_now && !mac_btn0_was) {
+        ADBMouseDown(0);
+    } else if (!mac_btn0_now && mac_btn0_was) {
+        ADBMouseUp(0);
+    }
+
+    // Middle button (0x04) passes through as Mac button 2
+    bool mid_now = (buttons & 0x04) != 0;
+    bool mid_was = (old_buttons & 0x04) != 0;
+
+    if (mid_now && !mid_was) {
+        ADBMouseDown(2);
+    } else if (!mid_now && mid_was) {
+        ADBMouseUp(2);
+    }
+
+    usb_mouse_buttons = buttons;
+
+    if (dx != 0 || dy != 0) {
+        ADBSetRelMouseMode(true);
+        ADBMouseMoved(dx, dy);
+    }
+}
+
+// ============================================================================
+// MultiDeviceUsbHost - USB Host with hub and multi-device support
+// ============================================================================
+
+class MultiDeviceUsbHost {
 public:
-    // Track modifier state with bitmask for proper left/right handling
-    // Bit 0: Left Control pressed
-    // Bit 1: Left Shift pressed
-    // Bit 2: Left Alt pressed
-    // Bit 3: Left GUI pressed
-    // Bit 4: Right Control pressed
-    // Bit 5: Right Shift pressed
-    // Bit 6: Right Alt pressed
-    // Bit 7: Right GUI pressed
-    uint8_t modifier_state = 0;
-    
-    // Track if keyboard is connected for LED control
-    bool has_keyboard = false;
-    
-    // Helper to check if a specific modifier is held (combining left+right)
-    bool isControlHeld() { return (modifier_state & 0x11) != 0; }
-    bool isShiftHeld() { return (modifier_state & 0x22) != 0; }
-    bool isAltHeld() { return (modifier_state & 0x44) != 0; }
-    bool isCommandHeld() { return (modifier_state & 0x88) != 0; }
-    
-    // Get combined mask for left+right variants of a modifier
-    // Bits 0,4 = Control, Bits 1,5 = Shift, Bits 2,6 = Alt, Bits 3,7 = GUI
-    uint8_t getCombinedMask(uint8_t bit) {
-        // Map bit 0-3 (left) or 4-7 (right) to combined mask
-        uint8_t base_bit = bit & 0x03;  // Get 0-3 regardless of left/right
-        return (1 << base_bit) | (1 << (base_bit + 4));  // Combine left and right
-    }
-    
-    // Process a single modifier bit change
-    // Only sends key down when FIRST of left/right is pressed
-    // Only sends key up when BOTH left and right are released
-    void handleModifierBit(uint8_t bit, bool pressed, uint8_t mac_keycode) {
-        uint8_t mask = (1 << bit);
-        uint8_t combined_mask = getCombinedMask(bit);
-        bool was_pressed = (modifier_state & mask) != 0;
-        bool either_was_pressed = (modifier_state & combined_mask) != 0;
-        
-        if (pressed && !was_pressed) {
-            // This side is being pressed
-            modifier_state |= mask;
-            // Only send key down if this is the first of left/right to be pressed
-            if (!either_was_pressed) {
-                ADBKeyDown(mac_keycode);
-            }
-        } else if (!pressed && was_pressed) {
-            // This side is being released
-            modifier_state &= ~mask;
-            // Only send key up if both left and right are now released
-            bool either_still_pressed = (modifier_state & combined_mask) != 0;
-            if (!either_still_pressed) {
-                ADBKeyUp(mac_keycode);
-            }
+    usb_host_client_handle_t clientHandle;
+    UsbDeviceSlot devices[MAX_USB_DEVICES];
+    uint32_t eventFlags;
+
+    MultiDeviceUsbHost() {
+        clientHandle = NULL;
+        eventFlags = 0;
+        for (int i = 0; i < MAX_USB_DEVICES; i++) {
+            memset(&devices[i], 0, sizeof(UsbDeviceSlot));
         }
     }
-    
-    // Called when USB keyboard report is received
-    void onKeyboard(hid_keyboard_report_t report, hid_keyboard_report_t last_report) override {
-        if (!keyboard_enabled) return;
-        
-        has_keyboard = true;
-        keyboard_connected = true;
-        
-        // Process modifier keys FIRST (important for key chords)
-        // USB modifier byte: [RGui][RAlt][RShift][RCtrl][LGui][LAlt][LShift][LCtrl]
-        handleModifierBit(0, (report.modifier & 0x01) != 0, 0x36);  // Left Control
-        handleModifierBit(1, (report.modifier & 0x02) != 0, 0x38);  // Left Shift
-        handleModifierBit(2, (report.modifier & 0x04) != 0, 0x3A);  // Left Alt/Option
-        handleModifierBit(3, (report.modifier & 0x08) != 0, 0x37);  // Left GUI/Command
-        handleModifierBit(4, (report.modifier & 0x10) != 0, 0x36);  // Right Control
-        handleModifierBit(5, (report.modifier & 0x20) != 0, 0x38);  // Right Shift
-        handleModifierBit(6, (report.modifier & 0x40) != 0, 0x3A);  // Right Alt/Option
-        handleModifierBit(7, (report.modifier & 0x80) != 0, 0x37);  // Right GUI/Command
-        
-        // Process key releases BEFORE key presses (important for key transitions)
-        for (int i = 0; i < 6; i++) {
-            uint8_t old_key = last_report.keycode[i];
-            if (old_key == 0) continue;
-            
-            // Check if this key is still pressed
-            bool still_pressed = false;
-            for (int j = 0; j < 6; j++) {
-                if (report.keycode[j] == old_key) {
-                    still_pressed = true;
-                    break;
-                }
-            }
-            
-            if (!still_pressed) {
-                uint8_t mac_code = usb_to_mac_keycode[old_key];
-                if (mac_code != 0xFF) {
-                    ADBKeyUp(mac_code);
-                }
-            }
+
+    void begin() {
+        const usb_host_config_t host_config = {
+            .skip_phy_setup = false,
+            .intr_flags = ESP_INTR_FLAG_LEVEL1,
+        };
+        esp_err_t err = usb_host_install(&host_config);
+        if (err != ESP_OK) {
+            Serial.printf("[USB] usb_host_install() err=0x%x\n", err);
         }
-        
-        // Process key presses
-        for (int i = 0; i < 6; i++) {
-            uint8_t new_key = report.keycode[i];
-            if (new_key == 0) continue;
-            
-            // Check if this is a new key press
-            bool was_pressed = false;
-            for (int j = 0; j < 6; j++) {
-                if (last_report.keycode[j] == new_key) {
-                    was_pressed = true;
-                    break;
-                }
+
+        const usb_host_client_config_t client_config = {
+            .is_synchronous = true,
+            .max_num_event_msg = 10,
+            .async = {
+                .client_event_callback = clientEventCallback,
+                .callback_arg = this,
             }
-            
-            if (!was_pressed) {
-                uint8_t mac_code = usb_to_mac_keycode[new_key];
-                if (mac_code != 0xFF) {
-                    ADBKeyDown(mac_code);
-                }
+        };
+        err = usb_host_client_register(&client_config, &clientHandle);
+        if (err != ESP_OK) {
+            Serial.printf("[USB] usb_host_client_register() err=0x%x\n", err);
+        }
+    }
+
+    void task() {
+        esp_err_t err = usb_host_lib_handle_events(1, &eventFlags);
+        (void)err;
+
+        err = usb_host_client_handle_events(clientHandle, 1);
+        (void)err;
+
+        unsigned long now = millis();
+        for (int d = 0; d < MAX_USB_DEVICES; d++) {
+            UsbDeviceSlot *dev = &devices[d];
+            if (!dev->active || !dev->ready) continue;
+            if ((now - dev->last_poll) < dev->interval) continue;
+            dev->last_poll = now;
+
+            for (int t = 0; t < dev->transfer_count; t++) {
+                if (dev->transfers[t] == NULL) continue;
+                usb_host_transfer_submit(dev->transfers[t]);
             }
         }
     }
-    
-    // Override onReceive to properly parse mouse HID reports
-    // The EspUsbHost library has wrong byte offsets for mouse parsing
-    void onReceive(const usb_transfer_t *transfer) override {
-        // Get endpoint data to check if this is a mouse
-        endpoint_data_t *ep_data = &endpoint_data_list[(transfer->bEndpointAddress & 0x0F)];
-        
-        // Handle HID mice - check for HID class and mouse protocol
-        // Don't require boot subclass since many mice use report protocol
-        if (ep_data->bInterfaceClass != 0x03) {  // HID class
-            return;
+
+    int findFreeSlot() {
+        for (int i = 0; i < MAX_USB_DEVICES; i++) {
+            if (!devices[i].active) return i;
         }
-        
-        // Skip if this looks like a keyboard (protocol 1)
-        if (ep_data->bInterfaceProtocol == 0x01) {
-            return;
-        }
-        
-        if (transfer->actual_num_bytes < 3) {
-            return;
-        }
-        
-        mouse_connected = true;
-        
-        // Try to detect report format based on data
-        uint8_t buttons = 0;
-        int16_t dx = 0;
-        int16_t dy = 0;
-        
-        // Logitech MX Master and similar mice use this format:
-        // Byte 0: Report ID (0x02 for mouse movement)
-        // Byte 1: Buttons
-        // Byte 2: Padding/unknown (usually 0x00)
-        // Bytes 3-4: X movement (16-bit signed, little endian)
-        // Bytes 5-6: Y movement (16-bit signed, little endian)
-        // Bytes 7-8: Wheel or other data
-        
-        if (transfer->actual_num_bytes >= 7 && transfer->data_buffer[0] == 0x02) {
-            // Logitech extended format with report ID
-            buttons = transfer->data_buffer[1];
-            dx = (int16_t)(transfer->data_buffer[3] | (transfer->data_buffer[4] << 8));
-            dy = (int16_t)(transfer->data_buffer[5] | (transfer->data_buffer[6] << 8));
-        } else if (transfer->actual_num_bytes >= 4 && transfer->data_buffer[0] <= 0x07) {
-            // Standard boot protocol: buttons, X, Y, wheel
-            buttons = transfer->data_buffer[0];
-            dx = (int8_t)transfer->data_buffer[1];
-            dy = (int8_t)transfer->data_buffer[2];
-        } else if (transfer->actual_num_bytes >= 5) {
-            // Try format with report ID: ReportID, buttons, X, Y
-            buttons = transfer->data_buffer[1];
-            dx = (int8_t)transfer->data_buffer[2];
-            dy = (int8_t)transfer->data_buffer[3];
-        } else {
-            // Fallback: assume boot protocol
-            buttons = transfer->data_buffer[0];
-            dx = (int8_t)transfer->data_buffer[1];
-            dy = (int8_t)transfer->data_buffer[2];
-        }
-        
-        // Handle button changes
-        uint8_t changed = buttons ^ usb_mouse_buttons;
-        
-        if (changed & 0x01) {
-            if (buttons & 0x01) {
-                ADBMouseDown(0);
-            } else {
-                ADBMouseUp(0);
-            }
-        }
-        
-        if (changed & 0x02) {
-            if (buttons & 0x02) {
-                ADBMouseDown(1);
-            } else {
-                ADBMouseUp(1);
-            }
-        }
-        
-        if (changed & 0x04) {
-            if (buttons & 0x04) {
-                ADBMouseDown(2);
-            } else {
-                ADBMouseUp(2);
-            }
-        }
-        
-        usb_mouse_buttons = buttons;
-        
-        // Handle movement
-        if (dx != 0 || dy != 0) {
-            ADBSetRelMouseMode(true);
-            ADBMouseMoved(dx, dy);
-        }
+        return -1;
     }
-    
-    // Keep these as empty overrides to prevent the buggy EspUsbHost parsing
-    void onMouseMove(hid_mouse_report_t report) override {
-        // Handled in onReceive instead
+
+    int findDeviceByHandle(usb_device_handle_t handle) {
+        for (int i = 0; i < MAX_USB_DEVICES; i++) {
+            if (devices[i].active && devices[i].handle == handle) return i;
+        }
+        return -1;
     }
-    
-    void onMouseButtons(hid_mouse_report_t report, uint8_t last_buttons) override {
-        // Handled in onReceive instead
+
+    int findKeyboardDevice() {
+        for (int i = 0; i < MAX_USB_DEVICES; i++) {
+            if (devices[i].active && devices[i].has_keyboard) return i;
+        }
+        return -1;
     }
-    
-    // Called when USB device is disconnected
-    void onGone(const usb_host_client_event_msg_t *eventMsg) override {
-        Serial.println("[INPUT] USB device disconnected");
-        keyboard_connected = false;
-        mouse_connected = false;
-        has_keyboard = false;
-        modifier_state = 0;  // Reset modifier state
+
+    bool hasAnyKeyboard() {
+        return findKeyboardDevice() >= 0;
     }
-    
-    // Send LED state to keyboard
+
     void setKeyboardLEDs(uint8_t leds) {
-        if (!has_keyboard || !isReady || deviceHandle == NULL) {
-            return;
-        }
-        
-        // USB HID SET_REPORT for keyboard LEDs
-        // Report ID 0, Output report, LED byte
+        int dev_idx = findKeyboardDevice();
+        if (dev_idx < 0) return;
+        UsbDeviceSlot *dev = &devices[dev_idx];
+        if (!dev->ready || dev->handle == NULL) return;
+
         usb_transfer_t *transfer;
         esp_err_t err = usb_host_transfer_alloc(8 + 1, 0, &transfer);
-        if (err != ESP_OK) {
-            Serial.printf("[INPUT] Failed to allocate transfer for LED: %x\n", err);
-            return;
-        }
-        
-        // Build SET_REPORT request
-        // bmRequestType: 0x21 (Host to Device, Class, Interface)
-        // bRequest: 0x09 (SET_REPORT)
-        // wValue: 0x0200 (Report Type: Output, Report ID: 0)
-        // wIndex: Interface number (0 for boot keyboard)
-        // wLength: 1 (one byte for LED state)
+        if (err != ESP_OK) return;
+
         transfer->num_bytes = 8 + 1;
-        transfer->data_buffer[0] = 0x21;  // bmRequestType
+        transfer->data_buffer[0] = 0x21;  // bmRequestType (Host->Device, Class, Interface)
         transfer->data_buffer[1] = 0x09;  // bRequest (SET_REPORT)
-        transfer->data_buffer[2] = 0x00;  // wValue low (Report ID)
-        transfer->data_buffer[3] = 0x02;  // wValue high (Report Type: Output)
-        transfer->data_buffer[4] = 0x00;  // wIndex low (Interface)
+        transfer->data_buffer[2] = 0x00;  // wValue low (Report ID 0)
+        transfer->data_buffer[3] = 0x02;  // wValue high (Output Report)
+        transfer->data_buffer[4] = 0x00;  // wIndex low (Interface 0)
         transfer->data_buffer[5] = 0x00;  // wIndex high
         transfer->data_buffer[6] = 0x01;  // wLength low
         transfer->data_buffer[7] = 0x00;  // wLength high
-        transfer->data_buffer[8] = leds;  // LED state byte
-        
-        transfer->device_handle = deviceHandle;
+        transfer->data_buffer[8] = leds;
+
+        transfer->device_handle = dev->handle;
         transfer->bEndpointAddress = 0x00;
-        transfer->callback = NULL;  // We don't need callback for LED
+        transfer->callback = NULL;
         transfer->context = NULL;
-        
+
         err = usb_host_transfer_submit_control(clientHandle, transfer);
         if (err != ESP_OK) {
-            Serial.printf("[INPUT] Failed to submit LED control transfer: %x\n", err);
+            Serial.printf("[USB] LED control transfer failed: 0x%x\n", err);
         }
-        
-        // Note: transfer will be freed when it completes
-        // For simplicity, we're using synchronous approach here
         usb_host_transfer_free(transfer);
+    }
+
+private:
+    static void clientEventCallback(const usb_host_client_event_msg_t *eventMsg, void *arg) {
+        MultiDeviceUsbHost *host = (MultiDeviceUsbHost *)arg;
+
+        switch (eventMsg->event) {
+        case USB_HOST_CLIENT_EVENT_NEW_DEV:
+            host->handleNewDevice(eventMsg->new_dev.address);
+            break;
+        case USB_HOST_CLIENT_EVENT_DEV_GONE:
+            host->handleDeviceGone(eventMsg->dev_gone.dev_hdl);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void handleNewDevice(uint8_t dev_addr) {
+        int slot = findFreeSlot();
+        if (slot < 0) {
+            Serial.println("[USB] No free device slots");
+            return;
+        }
+
+        UsbDeviceSlot *dev = &devices[slot];
+        memset(dev, 0, sizeof(UsbDeviceSlot));
+
+        esp_err_t err = usb_host_device_open(clientHandle, dev_addr, &dev->handle);
+        if (err != ESP_OK) {
+            Serial.printf("[USB] device_open(%d) err=0x%x\n", dev_addr, err);
+            return;
+        }
+
+        dev->active = true;
+
+        usb_device_info_t dev_info;
+        if (usb_host_device_info(dev->handle, &dev_info) == ESP_OK) {
+            Serial.printf("[USB] Device %d connected (addr=%d, speed=%d)\n",
+                          slot, dev_addr, dev_info.speed);
+        }
+
+        const usb_config_desc_t *config_desc;
+        err = usb_host_get_active_config_descriptor(dev->handle, &config_desc);
+        if (err != ESP_OK) {
+            Serial.printf("[USB] get_config_desc err=0x%x\n", err);
+            return;
+        }
+
+        enumerateDevice(slot, config_desc);
+
+        if (dev->has_keyboard) {
+            Serial.printf("[USB] Device %d: keyboard detected\n", slot);
+            keyboard_connected = true;
+        }
+        if (dev->has_mouse) {
+            Serial.printf("[USB] Device %d: mouse detected\n", slot);
+            mouse_connected = true;
+        }
+    }
+
+    void handleDeviceGone(usb_device_handle_t dev_hdl) {
+        int slot = findDeviceByHandle(dev_hdl);
+        if (slot < 0) {
+            usb_host_device_close(clientHandle, dev_hdl);
+            return;
+        }
+
+        UsbDeviceSlot *dev = &devices[slot];
+        bool was_keyboard = dev->has_keyboard;
+        bool was_mouse = dev->has_mouse;
+
+        Serial.printf("[USB] Device %d disconnected\n", slot);
+
+        for (int i = 0; i < dev->transfer_count; i++) {
+            if (dev->transfers[i] != NULL) {
+                usb_host_endpoint_clear(dev->handle, dev->transfers[i]->bEndpointAddress);
+                usb_host_transfer_free(dev->transfers[i]);
+                dev->transfers[i] = NULL;
+            }
+        }
+
+        for (int i = 0; i < dev->interface_count; i++) {
+            usb_host_interface_release(clientHandle, dev->handle, dev->interfaces[i]);
+        }
+
+        usb_host_device_close(clientHandle, dev->handle);
+
+        memset(dev, 0, sizeof(UsbDeviceSlot));
+
+        // Only reset connection flags if no other device provides the capability
+        if (was_keyboard) {
+            keyboard_connected = false;
+            for (int i = 0; i < MAX_USB_DEVICES; i++) {
+                if (devices[i].active && devices[i].has_keyboard) {
+                    keyboard_connected = true;
+                    break;
+                }
+            }
+            if (!keyboard_connected) {
+                kb_modifier_state = 0;
+            }
+        }
+        if (was_mouse) {
+            mouse_connected = false;
+            for (int i = 0; i < MAX_USB_DEVICES; i++) {
+                if (devices[i].active && devices[i].has_mouse) {
+                    mouse_connected = true;
+                    break;
+                }
+            }
+            if (!mouse_connected) {
+                usb_mouse_buttons = 0;
+                if (right_click_ctrl_injected) {
+                    ADBKeyUp(0x36);
+                    right_click_ctrl_injected = false;
+                }
+            }
+        }
+    }
+
+    void enumerateDevice(int slot, const usb_config_desc_t *config_desc) {
+        UsbDeviceSlot *dev = &devices[slot];
+        const uint8_t *p = &config_desc->val[0];
+        uint8_t bLength;
+
+        uint8_t cur_intf_class = 0;
+        uint8_t cur_intf_subclass = 0;
+        uint8_t cur_intf_protocol = 0;
+        bool cur_intf_claimed = false;
+
+        for (int i = 0; i < config_desc->wTotalLength; i += bLength, p += bLength) {
+            bLength = *p;
+            if (bLength == 0 || (i + bLength) > config_desc->wTotalLength) break;
+
+            uint8_t bDescriptorType = *(p + 1);
+
+            if (bDescriptorType == USB_INTERFACE_DESC) {
+                const usb_intf_desc_t *intf = (const usb_intf_desc_t *)p;
+                cur_intf_class = intf->bInterfaceClass;
+                cur_intf_subclass = intf->bInterfaceSubClass;
+                cur_intf_protocol = intf->bInterfaceProtocol;
+                cur_intf_claimed = false;
+
+                if (cur_intf_class == USB_CLASS_HID) {
+                    esp_err_t err = usb_host_interface_claim(
+                        clientHandle, dev->handle,
+                        intf->bInterfaceNumber, intf->bAlternateSetting);
+                    if (err == ESP_OK) {
+                        cur_intf_claimed = true;
+                        if (dev->interface_count < MAX_INTERFACES_PER_DEVICE) {
+                            dev->interfaces[dev->interface_count++] = intf->bInterfaceNumber;
+                        }
+                        if (cur_intf_protocol == HID_ITF_PROTOCOL_KEYBOARD) {
+                            dev->has_keyboard = true;
+                        } else {
+                            dev->has_mouse = true;
+                        }
+                    }
+                }
+
+            } else if (bDescriptorType == USB_ENDPOINT_DESC && cur_intf_claimed) {
+                const usb_ep_desc_t *ep_desc = (const usb_ep_desc_t *)p;
+
+                if ((ep_desc->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK)
+                    != USB_BM_ATTRIBUTES_XFER_INT)
+                    continue;
+                if (!(ep_desc->bEndpointAddress & USB_B_ENDPOINT_ADDRESS_EP_DIR_MASK))
+                    continue;
+
+                uint8_t ep_num = USB_EP_DESC_GET_EP_NUM(ep_desc);
+                if (ep_num < MAX_ENDPOINTS) {
+                    dev->endpoint_info[ep_num].bInterfaceClass = cur_intf_class;
+                    dev->endpoint_info[ep_num].bInterfaceSubClass = cur_intf_subclass;
+                    dev->endpoint_info[ep_num].bInterfaceProtocol = cur_intf_protocol;
+                }
+
+                if (dev->transfer_count < MAX_TRANSFERS_PER_DEVICE) {
+                    usb_transfer_t *xfer = NULL;
+                    esp_err_t err = usb_host_transfer_alloc(
+                        ep_desc->wMaxPacketSize + 1, 0, &xfer);
+                    if (err == ESP_OK && xfer != NULL) {
+                        xfer->device_handle = dev->handle;
+                        xfer->bEndpointAddress = ep_desc->bEndpointAddress;
+                        xfer->callback = transferCallback;
+                        xfer->context = (void *)(uintptr_t)slot;
+                        xfer->num_bytes = ep_desc->wMaxPacketSize;
+                        dev->transfers[dev->transfer_count++] = xfer;
+                        dev->interval = ep_desc->bInterval;
+                        dev->ready = true;
+                    }
+                }
+            }
+        }
+    }
+
+    static void transferCallback(usb_transfer_t *transfer) {
+        if (!usbHost) return;
+        if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) return;
+        if (transfer->actual_num_bytes == 0) return;
+
+        uint8_t dev_idx = (uint8_t)(uintptr_t)transfer->context;
+        if (dev_idx >= MAX_USB_DEVICES) return;
+
+        UsbDeviceSlot *dev = &usbHost->devices[dev_idx];
+        if (!dev->active) return;
+
+        uint8_t ep_num = transfer->bEndpointAddress & 0x0F;
+        if (ep_num >= MAX_ENDPOINTS) return;
+
+        EndpointInfo *ep_info = &dev->endpoint_info[ep_num];
+
+        // Boot keyboard: HID class, Boot subclass, Keyboard protocol
+        if (ep_info->bInterfaceClass == USB_CLASS_HID &&
+            ep_info->bInterfaceSubClass == HID_SUBCLASS_BOOT &&
+            ep_info->bInterfaceProtocol == HID_ITF_PROTOCOL_KEYBOARD &&
+            transfer->actual_num_bytes >= 8) {
+
+            hid_keyboard_report_t report;
+            report.modifier = transfer->data_buffer[0];
+            report.reserved = transfer->data_buffer[1];
+            report.keycode[0] = transfer->data_buffer[2];
+            report.keycode[1] = transfer->data_buffer[3];
+            report.keycode[2] = transfer->data_buffer[4];
+            report.keycode[3] = transfer->data_buffer[5];
+            report.keycode[4] = transfer->data_buffer[6];
+            report.keycode[5] = transfer->data_buffer[7];
+
+            if (memcmp(&report, &dev->last_kb_report, sizeof(report)) != 0) {
+                processKeyboardReport(&report, &dev->last_kb_report);
+                memcpy(&dev->last_kb_report, &report, sizeof(report));
+            }
+
+        } else if (ep_info->bInterfaceClass == USB_CLASS_HID &&
+                   ep_info->bInterfaceProtocol != HID_ITF_PROTOCOL_KEYBOARD) {
+            processMouseReport(transfer, ep_info);
+        }
     }
 };
 
@@ -688,7 +991,7 @@ static void processTouchInput(void)
  */
 static void updateKeyboardLEDs(void)
 {
-    if (usbHost == NULL || !usbHost->has_keyboard) {
+    if (usbHost == NULL || !usbHost->hasAnyKeyboard()) {
         return;
     }
     
@@ -698,10 +1001,8 @@ static void updateKeyboardLEDs(void)
     }
     last_led_check_time = now;
     
-    // Get current LED state from Mac
     uint8_t current_leds = ADBGetKeyboardLEDs();
     
-    // Update keyboard if state changed
     if (current_leds != last_led_state) {
         usbHost->setKeyboardLEDs(current_leds);
         last_led_state = current_leds;
@@ -726,16 +1027,12 @@ static void inputTask(void *param)
     uint8_t usb_poll_counter = 0;
     
     while (input_task_running) {
-        // Update M5 library (touch, buttons, etc.)
         M5.update();
         
-        // Process touch input
         processTouchInput();
         
-        // Process USB Host events (this is the slow part ~2ms).
-        // Keep full-rate polling while USB devices are active, but back off when idle.
         if (usbHost != NULL) {
-            bool usb_active = keyboard_connected || mouse_connected || usbHost->has_keyboard;
+            bool usb_active = keyboard_connected || mouse_connected;
             uint8_t target_divider = usb_active ? USB_POLL_DIV_ACTIVE : USB_POLL_DIV_IDLE;
             if (target_divider != usb_poll_divider) {
                 usb_poll_divider = target_divider;
@@ -749,10 +1046,8 @@ static void inputTask(void *param)
             }
         }
         
-        // Update keyboard LEDs (Caps Lock, etc.)
         updateKeyboardLEDs();
         
-        // Wait until next poll interval
         vTaskDelay(poll_interval);
     }
     
@@ -768,14 +1063,12 @@ bool InputInit(void)
 {
     Serial.println("[INPUT] Initializing input subsystem...");
     
-    // Get display dimensions from M5
     display_width = M5.Display.width();
     display_height = M5.Display.height();
     
     Serial.printf("[INPUT] Display size: %dx%d\n", display_width, display_height);
     Serial.printf("[INPUT] Mac screen size: %dx%d\n", mac_screen_width, mac_screen_height);
     
-    // Initialize touch state
     touch_was_pressed = false;
     touch_click_pending = false;
     last_touch_x = 0;
@@ -784,27 +1077,22 @@ bool InputInit(void)
     touch_start_y = 0;
     is_dragging = false;
     
-    // Initialize LED state
     last_led_state = 0;
     last_led_check_time = 0;
     
-    // Set mouse to absolute mode for touch input (USB mouse will switch to relative)
     ADBSetRelMouseMode(false);
     
     Serial.println("[INPUT] Touch input enabled");
     
-    // Initialize USB Host for keyboard/mouse on USB2 port
-    Serial.println("[INPUT] Initializing USB Host on USB2...");
-    usbHost = new MacUsbHost();
+    Serial.println("[INPUT] Initializing USB Host (hub support enabled)...");
+    usbHost = new MultiDeviceUsbHost();
     if (usbHost != NULL) {
         usbHost->begin();
-        Serial.println("[INPUT] USB Host initialized - connect keyboard/mouse to USB2 port");
+        Serial.println("[INPUT] USB Host initialized - connect keyboard/mouse (hub supported)");
     } else {
         Serial.println("[INPUT] ERROR: Failed to create USB Host instance");
     }
     
-    // Start input polling task on Core 0
-    // This offloads input processing from the CPU emulation loop
     input_task_running = true;
     BaseType_t result = xTaskCreatePinnedToCore(
         inputTask,
@@ -830,15 +1118,12 @@ void InputExit(void)
 {
     Serial.println("[INPUT] Shutting down input subsystem");
     
-    // Stop input task first
     if (input_task_running) {
         input_task_running = false;
-        // Give task time to exit gracefully
         vTaskDelay(pdMS_TO_TICKS(50));
         input_task_handle = NULL;
     }
     
-    // Release any held buttons
     if (touch_was_pressed) {
         if (!touch_click_pending) {
             ADBMouseUp(0);
@@ -847,7 +1132,12 @@ void InputExit(void)
         touch_click_pending = false;
     }
     
-    // Cleanup USB Host
+    // Release any injected right-click Control key
+    if (right_click_ctrl_injected) {
+        ADBKeyUp(0x36);
+        right_click_ctrl_injected = false;
+    }
+    
     if (usbHost != NULL) {
         delete usbHost;
         usbHost = NULL;
@@ -856,15 +1146,12 @@ void InputExit(void)
 
 void InputPoll(void)
 {
-    // Process touch input
     processTouchInput();
     
-    // Process USB Host events
     if (usbHost != NULL) {
         usbHost->task();
     }
     
-    // Update keyboard LEDs (Caps Lock, etc.)
     updateKeyboardLEDs();
 }
 
@@ -905,19 +1192,17 @@ bool InputIsMouseConnected(void)
 }
 
 // ============================================================================
-// Legacy functions (kept for compatibility, now handled via EspUsbHost callbacks)
+// Legacy functions (kept for compatibility, now handled via USB Host callbacks)
 // ============================================================================
 
 void InputProcessKeyboardReport(const uint8_t *report, int length)
 {
-    // No longer used - keyboard input comes via EspUsbHost callbacks
     (void)report;
     (void)length;
 }
 
 void InputProcessMouseReport(const uint8_t *report, int length)
 {
-    // No longer used - mouse input comes via EspUsbHost callbacks
     (void)report;
     (void)length;
 }

@@ -22,6 +22,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_attr.h"
+#include "esp_system.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -131,11 +132,51 @@ static uint8_t get_effective_volume(void)
 }
 
 /*
+ *  Reset ES8388 codec via I2C with proper timing.
+ *
+ *  After a soft reboot the codec retains whatever state it was in (it stays
+ *  powered).  The M5Unified callback writes the reset register back-to-back
+ *  with no delay, which is insufficient when the codec was actively processing
+ *  audio.  This pre-reset gives the codec adequate time to complete its
+ *  internal reset before the normal initialisation sequence runs.
+ */
+static constexpr uint8_t ES8388_I2C_ADDR  = 0x10;
+static constexpr uint8_t PI4IO1_I2C_ADDR  = 0x43;
+
+static void reset_es8388(void)
+{
+    Serial.println("[AUDIO] Pre-resetting ES8388 codec for warm boot...");
+
+    // Mute the amplifier while we reset to avoid pops.
+    M5.In_I2C.bitOff(PI4IO1_I2C_ADDR, 0x05, 0b00000010, 400000);
+
+    // Assert codec reset (register 0, bit 7).
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, 0x00, 0x80, 400000);
+    delay(100);
+
+    // Release reset.
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, 0x00, 0x00, 400000);
+    delay(50);
+
+    Serial.println("[AUDIO] ES8388 codec pre-reset complete");
+}
+
+/*
  *  Initialize M5Unified Speaker
  */
 static bool init_speaker(void)
 {
     Serial.println("[AUDIO] Initializing M5Unified Speaker...");
+
+    // After a crash or software reboot the ES8388 codec keeps its previous
+    // state because it never loses power.  The normal M5Unified init writes
+    // the reset register with no delay, which can leave the codec stuck.
+    // Perform an explicit reset with proper timing so the codec is in a
+    // known-good state before Speaker.begin() reconfigures it.
+    esp_reset_reason_t reason = esp_reset_reason();
+    if (reason != ESP_RST_POWERON && reason != ESP_RST_UNKNOWN) {
+        reset_es8388();
+    }
     
     // Get current speaker config
     auto spk_cfg = M5.Speaker.config();
