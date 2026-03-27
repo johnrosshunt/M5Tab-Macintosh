@@ -37,19 +37,21 @@
 #include "compiler/compemu.h"
 
 
-// RAM and ROM pointers
-uint32 RAMBaseMac = 0;		// RAM base (Mac address space) gb-- initializer is important
-uint8 *RAMBaseHost;			// RAM base (host address space)
-uint32 RAMSize;				// Size of RAM
-uint32 ROMBaseMac;			// ROM base (Mac address space)
-uint8 *ROMBaseHost;			// ROM base (host address space)
-uint32 ROMSize;				// Size of ROM
+// RAM and ROM pointers - DRAM_ATTR ensures fast internal SRAM placement.
+// These are loaded on every fast-path memory access; keeping them out of
+// PSRAM saves multiple cache-miss cycles per 68k instruction.
+DRAM_ATTR uint32 RAMBaseMac = 0;	// RAM base (Mac address space) gb-- initializer is important
+DRAM_ATTR uint8 *RAMBaseHost;		// RAM base (host address space)
+DRAM_ATTR uint32 RAMSize;			// Size of RAM
+DRAM_ATTR uint32 ROMBaseMac;		// ROM base (Mac address space)
+DRAM_ATTR uint8 *ROMBaseHost;		// ROM base (host address space)
+DRAM_ATTR uint32 ROMSize;			// Size of ROM
 
 #if !REAL_ADDRESSING
 // Mac frame buffer
-uint8 *MacFrameBaseHost;	// Frame buffer base (host address space)
-uint32 MacFrameSize;		// Size of frame buffer
-int MacFrameLayout;			// Frame buffer layout
+DRAM_ATTR uint8 *MacFrameBaseHost;	// Frame buffer base (host address space)
+DRAM_ATTR uint32 MacFrameSize;		// Size of frame buffer
+DRAM_ATTR int MacFrameLayout;		// Frame buffer layout
 #endif
 
 #if DIRECT_ADDRESSING

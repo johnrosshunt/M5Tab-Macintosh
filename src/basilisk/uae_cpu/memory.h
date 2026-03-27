@@ -136,26 +136,18 @@ extern void VideoMarkDirtyRange(uint32 offset, uint32 size);
 #endif
 
 // Fast-path long (32-bit) read
+// Framebuffer is excluded from read fast-path: Mac OS almost never reads its
+// own framebuffer. Removing those 2-3 comparisons from every non-RAM read
+// (ROM calls, hardware register reads) saves measurable cycles on the hot path.
 static inline uae_u32 longget_fastpath(uaecptr addr) {
-    // Fast path for RAM (most common case)
-    // RAM is at address 0, so just check if addr < RAMSize
     if (likely(addr < RAMSize)) {
         uae_u32 *m = (uae_u32 *)(RAMBaseHost + addr);
         return do_get_mem_long(m);
     }
-    // Fast path for direct-layout frame buffer reads
-    if (MacFrameLayout == FLAYOUT_DIRECT &&
-        addr >= BASILISK_FRAME_BASE_MAC &&
-        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
-        uae_u32 *m = (uae_u32 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
-        return do_get_mem_long(m);
-    }
-    // Fast path for ROM
     if (addr >= ROMBaseMac && addr < ROMBaseMac + ROMSize) {
         uae_u32 *m = (uae_u32 *)(ROMBaseHost + (addr - ROMBaseMac));
         return do_get_mem_long(m);
     }
-    // Fall back to bank lookup for other addresses (frame buffer, hardware, etc.)
     return call_mem_get_func(get_mem_bank(addr).lget, addr);
 }
 
@@ -163,12 +155,6 @@ static inline uae_u32 longget_fastpath(uaecptr addr) {
 static inline uae_u32 wordget_fastpath(uaecptr addr) {
     if (likely(addr < RAMSize)) {
         uae_u16 *m = (uae_u16 *)(RAMBaseHost + addr);
-        return do_get_mem_word(m);
-    }
-    if (MacFrameLayout == FLAYOUT_DIRECT &&
-        addr >= BASILISK_FRAME_BASE_MAC &&
-        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
-        uae_u16 *m = (uae_u16 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
         return do_get_mem_word(m);
     }
     if (addr >= ROMBaseMac && addr < ROMBaseMac + ROMSize) {
@@ -182,11 +168,6 @@ static inline uae_u32 wordget_fastpath(uaecptr addr) {
 static inline uae_u32 byteget_fastpath(uaecptr addr) {
     if (likely(addr < RAMSize)) {
         return *(uae_u8 *)(RAMBaseHost + addr);
-    }
-    if (MacFrameLayout == FLAYOUT_DIRECT &&
-        addr >= BASILISK_FRAME_BASE_MAC &&
-        addr < (BASILISK_FRAME_BASE_MAC + MacFrameSize)) {
-        return *(uae_u8 *)(MacFrameBaseHost + (addr - BASILISK_FRAME_BASE_MAC));
     }
     if (addr >= ROMBaseMac && addr < ROMBaseMac + ROMSize) {
         return *(uae_u8 *)(ROMBaseHost + (addr - ROMBaseMac));

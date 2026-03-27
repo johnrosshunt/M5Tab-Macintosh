@@ -149,6 +149,13 @@ static uint16 *push_buffer = streaming_row_buffer_b;
 static volatile bool force_full_update = true;               // Force full update on first frame or palette change
 static int dirty_tile_count = 0;                             // Count of dirty tiles for threshold check
 
+// PSRAM strip buffer for row-span merging optimization.
+// Holds one full-width row: 1280 pixels × 80 display-rows × 2 bytes = 204,800 bytes.
+// Adjacent dirty tiles in the same row are composed here and pushed with a single
+// setAddrWindow + DMA call, reducing DSI command overhead proportionally.
+#define STRIP_BUF_PIXELS (DISPLAY_WIDTH * TILE_HEIGHT * PIXEL_SCALE)
+static uint16 *strip_buffer = nullptr;
+
 // Display dimensions (from M5.Display)
 static int display_width = 0;
 static int display_height = 0;
@@ -1284,6 +1291,14 @@ bool VideoInit(bool classic)
     }
     
     Serial.printf("[VIDEO] Mac frame buffer allocated: %p (%d bytes)\n", mac_frame_buffer, frame_buffer_size);
+
+    // Allocate the PSRAM strip buffer used by the row-span merging optimization
+    strip_buffer = (uint16 *)ps_malloc(STRIP_BUF_PIXELS * sizeof(uint16));
+    if (!strip_buffer) {
+        Serial.println("[VIDEO] WARNING: Failed to allocate strip buffer in PSRAM - span merging disabled");
+    } else {
+        Serial.printf("[VIDEO] Strip buffer allocated: %p (%d bytes)\n", strip_buffer, (int)(STRIP_BUF_PIXELS * sizeof(uint16)));
+    }
     
     // Clear frame buffer to gray
     memset(mac_frame_buffer, 0x80, frame_buffer_size);

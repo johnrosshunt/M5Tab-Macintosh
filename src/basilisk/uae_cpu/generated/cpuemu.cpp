@@ -8479,7 +8479,7 @@ void REGPARAM2 CPUFUNC(op_2060_0)(uae_u32 opcode) /* MOVEA.L -(An),An */
 
 #endif
 #ifndef NOFLAGS
-void REGPARAM2 CPUFUNC(op_2068_0)(uae_u32 opcode) /* MOVEA.L (d16,An),An */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_2068_0)(uae_u32 opcode) /* MOVEA.L (d16,An),An */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -9154,7 +9154,7 @@ void REGPARAM2 CPUFUNC(op_2100_0)(uae_u32 opcode) /* MOVE.L Dn,-(An) */
 }}}m68k_incpc(2);
 	cpuop_end();
 }
-void REGPARAM2 CPUFUNC(op_2108_0)(uae_u32 opcode) /* MOVE.L An,-(An) */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_2108_0)(uae_u32 opcode) /* MOVE.L An,-(An) */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -17452,7 +17452,7 @@ void REGPARAM2 CPUFUNC(op_4e74_0)(uae_u32 opcode) /* RTD.L #<data>.W */
 
 #endif
 #ifndef NOFLAGS
-void REGPARAM2 CPUFUNC(op_4e75_0)(uae_u32 opcode) /* RTS.L  */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_4e75_0)(uae_u32 opcode) /* RTS.L  */
 {
 	cpuop_begin();
 {	m68k_do_rts();
@@ -19067,7 +19067,7 @@ void REGPARAM2 CPUFUNC(op_5179_0)(uae_u32 opcode) /* SUB.W #<data>,(xxx).L */
 }}}}}}}m68k_incpc(6);
 	cpuop_end();
 }
-void REGPARAM2 CPUFUNC(op_5180_0)(uae_u32 opcode) /* SUB.L #<data>,Dn */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_5180_0)(uae_u32 opcode) /* SUB.L #<data>,Dn */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -19330,7 +19330,7 @@ void REGPARAM2 CPUFUNC(op_51c0_0)(uae_u32 opcode) /* Scc.B Dn */
 
 #endif
 #ifndef NOFLAGS
-void REGPARAM2 CPUFUNC(op_51c8_0)(uae_u32 opcode) /* DBcc.W Dn,#<data>.W */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_51c8_0)(uae_u32 opcode) /* DBcc.W Dn,#<data>.W */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -22157,7 +22157,7 @@ endlabel1173: ;
 
 #endif
 #ifndef NOFLAGS
-void REGPARAM2 CPUFUNC(op_6100_0)(uae_u32 opcode) /* BSR.W #<data>.W */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_6100_0)(uae_u32 opcode) /* BSR.W #<data>.W */
 {
 	cpuop_begin();
 {{	uae_s16 src = get_iword(2);
@@ -22410,7 +22410,7 @@ endlabel1189: ;
 
 #endif
 #ifndef NOFLAGS
-void REGPARAM2 CPUFUNC(op_6601_0)(uae_u32 opcode) /* Bcc.B #<data> */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_6601_0)(uae_u32 opcode) /* Bcc.B #<data> */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -22460,7 +22460,7 @@ endlabel1192: ;
 
 #endif
 #ifndef NOFLAGS
-void REGPARAM2 CPUFUNC(op_6701_0)(uae_u32 opcode) /* Bcc.B #<data> */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_6701_0)(uae_u32 opcode) /* Bcc.B #<data> */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -22894,7 +22894,7 @@ endlabel1218: ;
 }
 
 #endif
-void REGPARAM2 CPUFUNC(op_7000_0)(uae_u32 opcode) /* MOVE.L #<data>,Dn */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_7000_0)(uae_u32 opcode) /* MOVE.L #<data>,Dn */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
@@ -31457,7 +31457,7 @@ void REGPARAM2 CPUFUNC(op_d03c_0)(uae_u32 opcode) /* ADD.B #<data>.B,Dn */
 }}}}}}m68k_incpc(4);
 	cpuop_end();
 }
-void REGPARAM2 CPUFUNC(op_d040_0)(uae_u32 opcode) /* ADD.W Dn,Dn */
+IRAM_ATTR void REGPARAM2 CPUFUNC(op_d040_0)(uae_u32 opcode) /* ADD.W Dn,Dn */
 {
 	cpuop_begin();
 #ifdef HAVE_GET_WORD_UNSWAPPED
