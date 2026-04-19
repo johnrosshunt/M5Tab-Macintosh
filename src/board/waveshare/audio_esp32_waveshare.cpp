@@ -34,6 +34,8 @@
 #include "bsp/esp32_p4_wifi6_touch_lcd_x.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
+#include "driver/i2s_std.h"
+#include "driver/gpio.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -117,6 +119,46 @@ static bool init_speaker(void)
 {
     Serial.println("[AUDIO] Initializing ES8311 codec via Waveshare BSP...");
 
+    /* Force-drive the NS4150B power amplifier enable pin high. The ES8311
+     * driver normally toggles it via the gpio_if registered by
+     * audio_codec_new_gpio(), but because we construct the codec via the
+     * BSP wrapper we want to be sure the amp is on even before the first
+     * DMA buffer plays. */
+    gpio_config_t pa_cfg = {
+        .pin_bit_mask = 1ULL << BSP_POWER_AMP_IO,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pa_cfg);
+    gpio_set_level((gpio_num_t)BSP_POWER_AMP_IO, 1);
+    Serial.printf("[AUDIO] Power amp enable GPIO%d driven high\n", (int)BSP_POWER_AMP_IO);
+
+    /* Force bsp_audio_init with a STEREO Philips config before the BSP's
+     * lazy-init path (called inside bsp_audio_codec_speaker_init) picks its
+     * default MONO config. Feeding stereo int16 samples through a MONO
+     * I2S channel is the most common cause of "silent audio" on this
+     * board. */
+    const i2s_std_config_t stereo_cfg = {
+        .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                        I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk         = (gpio_num_t)BSP_I2S_MCLK,
+            .bclk         = (gpio_num_t)BSP_I2S_SCLK,
+            .ws           = (gpio_num_t)BSP_I2S_LCLK,
+            .dout         = (gpio_num_t)BSP_I2S_DOUT,
+            .din          = (gpio_num_t)BSP_I2S_DSIN,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+    esp_err_t err = bsp_audio_init(&stereo_cfg);
+    if (err != ESP_OK) {
+        Serial.printf("[AUDIO] ERROR: bsp_audio_init(stereo) failed: %s\n", esp_err_to_name(err));
+        return false;
+    }
+
     codec_dev = bsp_audio_codec_speaker_init();
     if (codec_dev == NULL) {
         Serial.println("[AUDIO] ERROR: bsp_audio_codec_speaker_init returned NULL");
@@ -130,17 +172,22 @@ static bool init_speaker(void)
     fs.sample_rate     = AUDIO_SAMPLE_RATE;
     fs.mclk_multiple   = 0;
 
-    esp_err_t err = esp_codec_dev_open(codec_dev, &fs);
+    err = esp_codec_dev_open(codec_dev, &fs);
     if (err != ESP_OK) {
         Serial.printf("[AUDIO] ERROR: esp_codec_dev_open failed: %s\n", esp_err_to_name(err));
         codec_dev = NULL;
         return false;
     }
 
-    esp_codec_dev_set_out_vol(codec_dev, (float)get_effective_volume_percent());
+    /* Bump the initial volume: the Mac combined volume math gives only ~25%
+     * out of the box which is very quiet through the tiny onboard speaker.
+     * Mac OS Sound control panel can adjust via audio_set_*_volume(). */
+    esp_codec_dev_set_out_vol(codec_dev, 80.0f);
+    esp_codec_dev_set_out_mute(codec_dev, false);
 
-    Serial.printf("[AUDIO] Codec initialized: %d Hz, %d ch, %d bits\n",
+    Serial.printf("[AUDIO] Codec initialized: %d Hz, %d ch, %d bits, vol=80%%\n",
                   AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_SAMPLE_SIZE);
+
     speaker_initialized = true;
     return true;
 }
@@ -169,7 +216,15 @@ static void audioTask(void *param)
     const TickType_t active_poll_interval = pdMS_TO_TICKS(2);
     const TickType_t idle_poll_interval   = pdMS_TO_TICKS(20);
 
+    int last_num_sources = -1;
+
     while (audio_task_running) {
+        if (AudioStatus.num_sources != last_num_sources) {
+            Serial.printf("[AUDIO] num_sources %d -> %d\n",
+                          last_num_sources, AudioStatus.num_sources);
+            last_num_sources = AudioStatus.num_sources;
+        }
+
         if (AudioStatus.num_sources > 0 &&
             audio_open &&
             audio_irq_done_sem != NULL &&
