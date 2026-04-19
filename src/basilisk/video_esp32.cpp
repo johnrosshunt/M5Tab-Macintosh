@@ -323,17 +323,25 @@ static void initTileLuts(void)
  */
 static void initDefaultPalette(video_depth depth)
 {
+    /* Keep Serial.println OUT of the critical section. The spinlock is
+     * taken on the calling core AND blocks the opposite core when it
+     * attempts to read the palette in the video render path. If we
+     * printed from inside the critical section, a UART TX stall would
+     * starve the other core's interrupt watchdog and panic CPU0.
+     * We only log which path we took after the critical section exits. */
+    const char *log_msg = NULL;
+
     portENTER_CRITICAL(&frame_spinlock);
-    
+
     switch (depth) {
         case VDEPTH_1BIT:
             // 1-bit: Black and white
             // Index 0 = white, Index 1 = black
             palette_rgb565[0] = rgb888_to_rgb565(255, 255, 255);  // White
             palette_rgb565[1] = rgb888_to_rgb565(0, 0, 0);        // Black
-            Serial.println("[VIDEO] Initialized 1-bit B&W palette");
+            log_msg = "[VIDEO] Initialized 1-bit B&W palette";
             break;
-            
+
         case VDEPTH_2BIT:
             // 2-bit: 4 levels of gray
             // Index 0 = white, Index 3 = black
@@ -341,9 +349,9 @@ static void initDefaultPalette(video_depth depth)
             palette_rgb565[1] = rgb888_to_rgb565(170, 170, 170);  // Light gray
             palette_rgb565[2] = rgb888_to_rgb565(85, 85, 85);     // Dark gray
             palette_rgb565[3] = rgb888_to_rgb565(0, 0, 0);        // Black
-            Serial.println("[VIDEO] Initialized 2-bit grayscale palette");
+            log_msg = "[VIDEO] Initialized 2-bit grayscale palette";
             break;
-            
+
         case VDEPTH_4BIT:
             // 4-bit: Classic Mac 16-color palette
             // This matches the standard Mac 16-color CLUT
@@ -370,7 +378,7 @@ static void initDefaultPalette(video_depth depth)
                     palette_rgb565[i] = rgb888_to_rgb565(mac16[i][0], mac16[i][1], mac16[i][2]);
                 }
             }
-            Serial.println("[VIDEO] Initialized 4-bit 16-color palette");
+            log_msg = "[VIDEO] Initialized 4-bit 16-color palette";
             break;
             
         case VDEPTH_8BIT:
@@ -401,12 +409,16 @@ static void initDefaultPalette(video_depth depth)
                     palette_rgb565[idx++] = rgb888_to_rgb565(gray, gray, gray);
                 }
             }
-            Serial.println("[VIDEO] Initialized 8-bit 256-color palette");
+            log_msg = "[VIDEO] Initialized 8-bit 256-color palette";
             break;
     }
-    
+
     portEXIT_CRITICAL(&frame_spinlock);
-    
+
+    if (log_msg) {
+        Serial.println(log_msg);
+    }
+
     // Force a full screen update since palette changed
     force_full_update = true;
 }
