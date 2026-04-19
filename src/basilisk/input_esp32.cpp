@@ -20,7 +20,13 @@
 #include "adb.h"
 #include "video.h"
 
+#include "board.h"
+#include "board_touch.h"
+#include "board_display.h"
+
+#if defined(BOARD_M5STACK_TAB5)
 #include <M5Unified.h>
+#endif
 #include <usb/usb_host.h>
 #include <class/hid/hid.h>
 #include "esp_attr.h"
@@ -249,12 +255,15 @@ DRAM_ATTR static const uint8_t usb_to_mac_keycode[256] = {
 // ============================================================================
 
 // Mac screen dimensions for coordinate scaling
-static int mac_screen_width = 640;
-static int mac_screen_height = 360;
+/* Mac framebuffer dimensions come from the board config (640x360 on Tab5,
+ * 640x400 on Waveshare). InputSetScreenSize() can still override at runtime
+ * if the emulator switches modes. */
+static int mac_screen_width  = BOARD_MAC_SCREEN_WIDTH;
+static int mac_screen_height = BOARD_MAC_SCREEN_HEIGHT;
 
-// Display dimensions (from M5.Display)
-static int display_width = 1280;
-static int display_height = 720;
+// Display dimensions (populated from BoardDisplay_* in InputInit)
+static int display_width  = BOARD_DISPLAY_WIDTH;
+static int display_height = BOARD_DISPLAY_HEIGHT;
 
 // Input enable flags
 static bool touch_enabled = true;
@@ -915,10 +924,10 @@ static void processTouchInput(void)
 {
     if (!touch_enabled) return;
 
-    // Get touch state from M5Unified
-    auto touch_detail = M5.Touch.getDetail();
+    // Get touch state from the board HAL (M5.Touch on Tab5, GT911 on Waveshare)
+    BoardTouchDetail touch_detail = BoardTouch_GetDetail();
 
-    bool is_pressed = touch_detail.isPressed();
+    bool is_pressed = touch_detail.pressed;
     int touch_x = touch_detail.x;
     int touch_y = touch_detail.y;
 
@@ -1027,7 +1036,7 @@ static void inputTask(void *param)
     uint8_t usb_poll_counter = 0;
     
     while (input_task_running) {
-        M5.update();
+        Board_Update();
         
         processTouchInput();
         
@@ -1063,8 +1072,8 @@ bool InputInit(void)
 {
     Serial.println("[INPUT] Initializing input subsystem...");
     
-    display_width = M5.Display.width();
-    display_height = M5.Display.height();
+    display_width  = BoardDisplay_Width();
+    display_height = BoardDisplay_Height();
     
     Serial.printf("[INPUT] Display size: %dx%d\n", display_width, display_height);
     Serial.printf("[INPUT] Mac screen size: %dx%d\n", mac_screen_width, mac_screen_height);

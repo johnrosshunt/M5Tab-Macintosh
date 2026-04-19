@@ -7,7 +7,7 @@
 #include "sysdeps.h"
 #include "xpram.h"
 
-#include <SD.h>
+#include "board_sd.h"  /* SD_FS alias */
 
 #define DEBUG 1
 #include "debug.h"
@@ -34,7 +34,7 @@ void LoadXPRAM(const char *vmdir)
     memset(XPRAM, 0, XPRAM_SIZE);
     
     // Try to load from SD card
-    File f = SD.open(XPRAM_FILE_PATH, FILE_READ);
+    File f = SD_FS.open(XPRAM_FILE_PATH, FILE_READ);
     if (f) {
         size_t bytes_read = f.read(XPRAM, XPRAM_SIZE);
         f.close();
@@ -56,7 +56,7 @@ void SaveXPRAM(void)
         return;
     }
     
-    File f = SD.open(XPRAM_FILE_PATH, FILE_WRITE);
+    File f = SD_FS.open(XPRAM_FILE_PATH, FILE_WRITE);
     if (f) {
         size_t bytes_written = f.write(XPRAM, XPRAM_SIZE);
         f.close();
@@ -76,5 +76,5 @@ void ZapPRAM(void)
     if (XPRAM != NULL) {
         memset(XPRAM, 0, XPRAM_SIZE);
     }
-    SD.remove(XPRAM_FILE_PATH);
+    SD_FS.remove(XPRAM_FILE_PATH);
 }

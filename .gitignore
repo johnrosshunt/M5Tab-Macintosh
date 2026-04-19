@@ -29,6 +29,18 @@ release/
 
 # Library dependencies (managed by PlatformIO)
 lib/*/
+# ...except our vendored dependencies for the Waveshare build, which must
+# be tracked so the Waveshare env builds out of the box.
+!lib/esp32_p4_wifi6_touch_lcd_x/
+!lib/esp32_p4_wifi6_touch_lcd_x/**
+!lib/esp_lcd_jd9365/
+!lib/esp_lcd_jd9365/**
+!lib/esp_lcd_touch/
+!lib/esp_lcd_touch/**
+!lib/esp_lcd_touch_gt911/
+!lib/esp_lcd_touch_gt911/**
+!lib/esp_codec_dev/
+!lib/esp_codec_dev/**
 
 # macOS
 .DS_Store
@@ -64,3 +76,7 @@ Desktop.ini
 # Secrets and credentials (if any)
 secrets.h
 credentials.h
+
+# idf_component.yml at project root is generated per-env by
+# scripts/select_component_yml.py from idf_component_{tab5,waveshare}.yml.
+idf_component.yml

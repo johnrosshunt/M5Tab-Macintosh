@@ -1,0 +1,48 @@
+{
+    "name": "esp_codec_dev",
+    "version": "1.5.7",
+    "description": "ESP-IDF component (vendored from espressif/esp_codec_dev): audio codec abstraction layer with drivers for ES8311, ES7210, and others.",
+    "license": "Apache-2.0",
+    "frameworks": "arduino, espidf",
+    "platforms": "espressif32",
+    "build": {
+        "srcDir": "src",
+        "includeDir": "include",
+        "srcFilter": [
+            "+<*.c>",
+            "+<device/**/*.c>",
+            "+<platform/*.c>",
+            "-<device/zl38063/example_apps/>",
+            "-<platform/audio_codec_data_adc.c>"
+        ],
+        "flags": [
+            "-Isrc",
+            "-Isrc/interface",
+            "-Isrc/device/include",
+            "-Isrc/device/priv_include",
+            "-Iinclude",
+            "-Isrc/device/es8311",
+            "-Isrc/device/es8388",
+            "-Isrc/device/es8374",
+            "-Isrc/device/es8389",
+            "-Isrc/device/es8156",
+            "-Isrc/device/es7210",
+            "-Isrc/device/es7243",
+            "-Isrc/device/es7243e",
+            "-Isrc/device/aw88298",
+            "-Isrc/device/cjc8910",
+            "-Isrc/device/dummy",
+            "-Isrc/device/tas5805m",
+            "-Isrc/device/zl38063",
+            "-Isrc/device/zl38063/api_lib",
+            "-Isrc/device/zl38063/firmware",
+            "-DCONFIG_CODEC_ES8311_SUPPORT=1",
+            "-DCONFIG_CODEC_ES7210_SUPPORT=1",
+            "-DCONFIG_CODEC_ES8388_SUPPORT=1",
+            "-DCONFIG_CODEC_DUMMY_SUPPORT=1",
+            "-DCONFIG_CODEC_I2S_SUPPORT=1",
+            "-DCONFIG_CODEC_I2C_SUPPORT=1",
+            "-DCONFIG_CODEC_GPIO_SUPPORT=1"
+        ]
+    }
+}

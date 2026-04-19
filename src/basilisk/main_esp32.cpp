@@ -10,9 +10,13 @@
 
 #include "sysdeps.h"
 
+#if defined(BOARD_M5STACK_TAB5)
 #include <M5Unified.h>
 #include <M5GFX.h>
-#include <SD.h>
+#endif
+#include "board_config.h"
+#include "board_display.h"
+#include "board_sd.h"  /* SD_FS alias */
 #include <esp_heap_caps.h>
 
 // FreeRTOS for dual-core support and timers
@@ -330,14 +334,28 @@ void FlushCodeCache(void *start, uint32 size)
 void ErrorAlert(const char *text)
 {
     Serial.printf("[ERROR] %s\n", text);
-    
-    // Also display on screen if possible
-    M5.Display.fillScreen(TFT_RED);
-    M5.Display.setTextColor(TFT_WHITE);
-    M5.Display.setTextSize(2);
-    M5.Display.setCursor(10, 10);
-    M5.Display.println("BasiliskII Error:");
-    M5.Display.println(text);
+
+    // Also display on screen if possible. TFT_RED/TFT_WHITE are LovyanGFX
+    // constants; on boards that don't use LovyanGFX we pass equivalent
+    // RGB565 colors directly.
+#if defined(BOARD_M5STACK_TAB5)
+    auto &gfx = BoardDisplay_Gfx();
+    gfx.fillScreen(TFT_RED);
+    gfx.setTextColor(TFT_WHITE);
+    gfx.setTextSize(2);
+    gfx.setTextDatum(TL_DATUM);
+    gfx.drawString("BasiliskII Error:", 10, 10);
+    gfx.drawString(text, 10, 40);
+#else
+    auto &gfx = BoardDisplay_Gfx();
+    gfx.fillScreen(0xF800u);  /* TFT_RED   in RGB565 */
+    gfx.setTextColor(0xFFFFu); /* TFT_WHITE in RGB565 */
+    gfx.setTextSize(2);
+    gfx.setTextDatum(TL_DATUM);
+    gfx.drawString("BasiliskII Error:", 10, 10);
+    gfx.drawString(text, 10, 40);
+    gfx.flushAll();
+#endif
 }
 
 /*
@@ -373,7 +391,7 @@ static bool LoadROM(const char *rom_path)
 {
     Serial.printf("[MAIN] Loading ROM from: %s\n", rom_path);
     
-    File rom_file = SD.open(rom_path, FILE_READ);
+    File rom_file = SD_FS.open(rom_path, FILE_READ);
     if (!rom_file) {
         Serial.printf("[MAIN] ERROR: Cannot open ROM file: %s\n", rom_path);
         return false;

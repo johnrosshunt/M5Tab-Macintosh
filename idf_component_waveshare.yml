@@ -1,0 +1,16 @@
+## IDF Component Manager manifest for the Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1
+## build. Mirrors the requirements of the vendored BSP in
+## lib/esp32_p4_wifi6_touch_lcd_x/idf_component.yml.
+##
+## Arduino-ESP32 from pioarduino 55.x already ships esp_wifi_remote and
+## esp_hosted as part of its bundled libs, so we do not need to re-declare
+## those here (doing so forces a recompile of the Arduino framework).
+dependencies:
+  idf:
+    version: ">=5.5"
+  espressif/esp_codec_dev:
+    version: "~1.5"
+  espressif/esp_lcd_touch_gt911:
+    version: "^1"
+  espressif/esp_lcd_jd9365:
+    version: "*"

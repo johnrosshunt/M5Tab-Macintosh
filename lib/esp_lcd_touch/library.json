@@ -1,0 +1,17 @@
+{
+    "name": "esp_lcd_touch",
+    "version": "1.2.1",
+    "description": "ESP-IDF component (vendored): common touch controller interface used by esp_lcd_touch_gt911.",
+    "license": "Apache-2.0",
+    "frameworks": "arduino, espidf",
+    "platforms": "espressif32",
+    "build": {
+        "srcDir": "src",
+        "includeDir": "include",
+        "srcFilter": ["+<*.c>"],
+        "flags": [
+            "-DCONFIG_ESP_LCD_TOUCH_MAX_POINTS=5",
+            "-DCONFIG_ESP_LCD_TOUCH_MAX_BUTTONS=1"
+        ]
+    }
+}

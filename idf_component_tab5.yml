@@ -1,0 +1,8 @@
+## IDF Component Manager manifest for the M5Stack Tab5 build.
+##
+## Tab5 uses M5Unified/M5GFX (Arduino libraries declared in platformio.ini)
+## for all hardware access, so no extra ESP-IDF managed components are needed.
+## This file intentionally only pins the IDF version.
+dependencies:
+  idf:
+    version: ">=5.5"
