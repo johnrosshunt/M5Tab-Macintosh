@@ -80,3 +80,6 @@ credentials.h
 # idf_component.yml at project root is generated per-env by
 # scripts/select_component_yml.py from idf_component_{tab5,waveshare}.yml.
 idf_component.yml
+
+# Asset headers emitted by scripts/build_assets.py from ./assets at pre-build.
+src/generated/

@@ -52,6 +52,11 @@ extern "C" void BoardDisplay_PushFullFrame(const uint16_t *pixels)
     M5.Display.pushImage(0, 0, M5.Display.width(), M5.Display.height(), pixels);
 }
 
+extern "C" void BoardDisplay_ClearScreen(uint16_t color)
+{
+    M5.Display.fillScreen(color);
+}
+
 extern "C" void BoardDisplay_FillRect(int x, int y, int w, int h, uint16_t color)
 {
     M5.Display.fillRect(x, y, w, h, color);

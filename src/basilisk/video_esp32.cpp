@@ -139,19 +139,22 @@ DRAM_ATTR static uint8 tile_col_lut[MAC_SCREEN_WIDTH];
 DRAM_ATTR static uint8 tile_row_base_lut[MAC_SCREEN_HEIGHT];
 static bool tile_lut_initialized = false;
 
-// Double-buffered row buffers for streaming full-frame renders with async DMA
-// Processes 4 Mac rows at a time (becomes 8 display rows with 2x scaling)
-// Size: 1280 pixels * 8 rows * 2 bytes = 20,480 bytes (20KB) per buffer
-// Double-buffering allows rendering to one buffer while DMA pushes the other
-// In internal SRAM for fast access during full-frame renders
-#define STREAMING_ROW_COUNT 8
-DRAM_ATTR static uint16 streaming_row_buffer_a[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
-DRAM_ATTR static uint16 streaming_row_buffer_b[DISPLAY_WIDTH * STREAMING_ROW_COUNT];
-static uint16 *render_buffer = streaming_row_buffer_a;
-static uint16 *push_buffer = streaming_row_buffer_b;
+// The old "streaming full-frame render" path with its 2x 20 KB DRAM_ATTR
+// row buffers has been removed. DIRTY_THRESHOLD_PERCENT=101 means we are
+// always in tile-render mode, so those 40 KB of BSS were dead at runtime
+// and just prevented cpufunctbl (256 KB) from landing in internal SRAM.
+// The one-shot VideoInit clear now goes through BoardDisplay_ClearScreen.
 
 static volatile bool force_full_update = true;               // Force full update on first frame or palette change
 static int dirty_tile_count = 0;                             // Count of dirty tiles for threshold check
+
+// When true, the video task suppresses its own frame pushes (even a
+// force_full_update one) until Mac OS writes something real into the Mac
+// frame buffer. That keeps the classic-Mac pre-boot splash (the tiled
+// checkerboard + Happy Mac painted by MacSplash) on screen right up to
+// the moment the emulator actually starts drawing, instead of flashing
+// solid gray in between. Cleared by the task itself on first real write.
+static volatile bool preserve_splash_until_first_write = false;
 
 // PSRAM strip buffer for row-span merging optimization.
 // Holds one full-width row: 1280 pixels × 80 display-rows × 2 bytes = 204,800 bytes.
@@ -988,141 +991,6 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
 }
 
 /*
- *  Render frame buffer directly to display using streaming (no intermediate PSRAM buffer)
- *  
- *  This optimized version eliminates the 1.8MB dsi_framebuffer by:
- *  1. Processing 2 Mac rows at a time (becomes 4 display rows with 2x scaling)
- *  2. Converting 8-bit indexed to RGB565 into internal SRAM row buffer
- *  3. Immediately pushing to display via M5GFX
- *  
- *  PSRAM traffic: ~230KB read (mac_frame_buffer only)
- *  vs old method: ~230KB read + 1.8MB write + 1.8MB read = ~3.8MB
- *  
- *  Supports all bit depths (1/2/4/8-bit) by decoding packed pixels first.
- */
-static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
-{
-    if (!src_buffer) return;
-    
-    // Get current depth and bytes per row (volatile, so copy locally)
-    video_depth depth = current_depth;
-    uint32 bpr = current_bytes_per_row;
-    
-    // Row decode buffer for packed pixel modes
-    // In internal SRAM for fast access during rendering
-    DRAM_ATTR static uint8 decoded_row[MAC_SCREEN_WIDTH];
-    
-    // Track if we have a pending DMA transfer
-    bool dma_pending = false;
-    int pending_display_y = 0;
-    
-    BoardDisplay_BeginTiles();
-
-    // Process 4 Mac rows at a time (produces 8 display rows with 2x scaling)
-    // Double-buffering: render to one buffer while DMA pushes the other
-    for (int mac_y = 0; mac_y < MAC_SCREEN_HEIGHT; mac_y += 4) {
-        uint16 *out = render_buffer;
-        
-        // Process 4 Mac rows into render_buffer
-        for (int row_offset = 0; row_offset < 4; row_offset++) {
-            int y = mac_y + row_offset;
-            if (y >= MAC_SCREEN_HEIGHT) break;
-            
-            // Get source row pointer
-            uint8 *src_row = src_buffer + y * bpr;
-            
-            // Decode the row if needed (converts packed pixels to 8-bit indices)
-            uint8 *pixel_row;
-            if (depth == VDEPTH_8BIT) {
-                // 8-bit mode: direct access, no decoding needed
-                pixel_row = src_row;
-            } else {
-                // Packed mode: decode to 8-bit indices
-                decodePackedRow(src_row, decoded_row, MAC_SCREEN_WIDTH, depth);
-                pixel_row = decoded_row;
-            }
-            
-            // Output row pointers for the two scaled display rows
-            uint16 *dst_row0 = out;
-            uint16 *dst_row1 = out + DISPLAY_WIDTH;
-            
-            // Process 4 decoded pixels at a time for better memory bandwidth
-            int x = 0;
-            for (; x < MAC_SCREEN_WIDTH - 3; x += 4) {
-                // Read 4 decoded pixels at once (32-bit read from 8-bit indices)
-                uint32 src4 = *((uint32 *)(pixel_row + x));
-                
-                // Convert each pixel through palette and write 2x2 scaled
-                uint16 c0 = local_palette[src4 & 0xFF];
-                uint16 c1 = local_palette[(src4 >> 8) & 0xFF];
-                uint16 c2 = local_palette[(src4 >> 16) & 0xFF];
-                uint16 c3 = local_palette[(src4 >> 24) & 0xFF];
-                
-                // Write to row 0 (2 pixels per source pixel)
-                dst_row0[0] = c0; dst_row0[1] = c0;
-                dst_row0[2] = c1; dst_row0[3] = c1;
-                dst_row0[4] = c2; dst_row0[5] = c2;
-                dst_row0[6] = c3; dst_row0[7] = c3;
-                
-                // Write to row 1 (duplicate of row 0)
-                dst_row1[0] = c0; dst_row1[1] = c0;
-                dst_row1[2] = c1; dst_row1[3] = c1;
-                dst_row1[4] = c2; dst_row1[5] = c2;
-                dst_row1[6] = c3; dst_row1[7] = c3;
-                
-                dst_row0 += 8;
-                dst_row1 += 8;
-            }
-            
-            // Handle remaining pixels (if width not divisible by 4)
-            for (; x < MAC_SCREEN_WIDTH; x++) {
-                uint16 c = local_palette[pixel_row[x]];
-                dst_row0[0] = c; dst_row0[1] = c;
-                dst_row1[0] = c; dst_row1[1] = c;
-                dst_row0 += 2;
-                dst_row1 += 2;
-            }
-            
-            // Move output pointer by 2 display rows (2x vertical scaling)
-            out += DISPLAY_WIDTH * 2;
-        }
-        
-        // Wait for any pending DMA transfer to complete before swapping buffers
-        if (dma_pending) {
-            BoardDisplay_WaitPush();
-            dma_pending = false;
-        }
-        
-        // Swap buffers - render_buffer becomes push_buffer for DMA
-        uint16 *temp = render_buffer;
-        render_buffer = push_buffer;
-        push_buffer = temp;
-        
-        // Start async push of the just-rendered buffer (now in push_buffer)
-        // 8 display rows * DISPLAY_WIDTH pixels per chunk
-        int display_y = mac_y * PIXEL_SCALE;
-        BoardDisplay_PushTile(0, display_y,
-                              DISPLAY_WIDTH, STREAMING_ROW_COUNT,
-                              push_buffer);
-        dma_pending = true;
-        pending_display_y = display_y;
-        
-        // Yield every 32 Mac rows (8 iterations) to let IDLE task run
-        // This prevents watchdog timeout during full-frame renders
-        if ((mac_y & 0x1F) == 0) {
-            taskYIELD();
-        }
-    }
-    
-    // Wait for final DMA transfer to complete
-    if (dma_pending) {
-        BoardDisplay_WaitPush();
-    }
-
-    BoardDisplay_EndTiles();
-}
-
-/*
  *  Stop the video rendering task
  */
 static void stopVideoTask(void)
@@ -1250,7 +1118,22 @@ static void videoRenderTaskOptimized(void *param)
         dirty_tile_count = collectWriteDirtyTiles();
         t1 = micros();
         perf_detect_us += (t1 - t0);
-        
+
+        // Keep the pre-boot splash on screen until Mac OS actually writes
+        // to the frame buffer. If we're still in that window and nothing
+        // has been dirtied yet, skip the push entirely (no blank gray
+        // frame between checkerboard and Mac boot). The moment the first
+        // real write lands we fall through and do the full-frame push
+        // that force_full_update requested during VideoInit.
+        if (preserve_splash_until_first_write) {
+            if (dirty_tile_count == 0) {
+                perf_skip_count++;
+                continue;
+            }
+            preserve_splash_until_first_write = false;
+            Serial.println("[VIDEO] First Mac OS write detected, handing off from splash");
+        }
+
         // If force_full_update is set (palette change, first frame), mark ALL tiles dirty
         // This ensures we always use tile mode (faster than streaming mode)
         if (force_full_update) {
@@ -1335,20 +1218,14 @@ bool VideoInit(bool classic)
     memset(dirty_tiles, 0, sizeof(dirty_tiles));
     memset(write_dirty_tiles, 0, sizeof(write_dirty_tiles));
     memset(tile_render_active, 0, sizeof(tile_render_active));
-    force_full_update = true;  // Force full update on first frame
-    
-    // Clear display to dark gray using streaming row buffer
-    uint16 gray565 = rgb888_to_rgb565(64, 64, 64);
-    for (int i = 0; i < DISPLAY_WIDTH * STREAMING_ROW_COUNT; i++) {
-        streaming_row_buffer_a[i] = gray565;
-    }
-    BoardDisplay_BeginTiles();
-    for (int y = 0; y < DISPLAY_HEIGHT; y += STREAMING_ROW_COUNT) {
-        BoardDisplay_PushTile(0, y, DISPLAY_WIDTH, STREAMING_ROW_COUNT, streaming_row_buffer_a);
-        BoardDisplay_WaitPush();
-    }
-    BoardDisplay_EndTiles();
-    Serial.println("[VIDEO] Initial screen cleared");
+    force_full_update = true;  // Force full update on first real Mac OS write
+
+    // Don't clear the panel here. The MacSplash checkerboard painted at
+    // pre-boot stays visible until the 68k actually starts drawing, at
+    // which point the video task (below) will push real tiles over it.
+    // preserve_splash_until_first_write gates that handoff.
+    preserve_splash_until_first_write = true;
+    Serial.println("[VIDEO] Splash preserved until first Mac OS write");
     
     // Set up Mac frame buffer pointers
     MacFrameBaseHost = mac_frame_buffer;

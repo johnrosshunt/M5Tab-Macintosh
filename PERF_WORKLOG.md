@@ -380,3 +380,100 @@ Important correction:
 - I added a guard: direct bus DMA is now used only for `bus_spi` and `bus_parallel*`.
   DSI falls back to `M5.Display.writePixelsDMA()` to keep the display working.
 - The big render win above is therefore not applicable on DSI hardware.
+
+## Waveshare perf pass (2026-04-19): what we learned
+
+### Round 1 (sdram/fused-rotate/POSIX) - reverted
+- Changed SD to HIGHSPEED (kept), rewrote Sys_* to POSIX pread/pwrite (reverted),
+  fused the tile rotation/scale directly in the HAL (reverted), 8x8 block
+  transpose fallback (reverted).
+- Benchmark after build+flash (Mac Quadra 605 = 1.0):
+  - CPU 0.528 -> 0.519, Disk 0.769 -> 0.792, Graphics 0.417 -> 0.416,
+    Math 6.428 -> 6.243. All within noise.
+- Read-through: Disk and Graphics benchmarks are Mac-side HFS and QuickDraw
+  code running on the 68k interpreter. They track *emulated 68k speed*,
+  not our real SD bandwidth or display pipeline. Math escapes the
+  interpreter (host IEEE FPU) and is the only metric at 6x, confirming
+  everything else is interpreter-bound.
+- All three changes were outside the 68k hot path, which is why the scores
+  did not move.
+
+### Round 2 (400 MHz bump + shed streaming buffers for cpufunctbl)
+- Captured a boot log. Two findings:
+  1. `[MAIN] CPU Frequency: 360 MHz` - pioarduino's precompiled ESP-IDF
+     accepts only 360 MHz in `setCpuFrequencyMhz`:
+     `CPU clock could not be set to 400 MHz. Supported frequencies: 360 MHz`.
+     Hitting 400 would require rebuilding ESP-IDF from source.
+  2. `cpufunctbl (256KB) in PSRAM (fallback)` is structural, not BSS
+     fragmentation. At boot the internal heap has 344 KB free total but
+     the largest contiguous block is 253 KB because the P4 DIRAM is
+     split into multiple discontiguous pools. Shedding 20 KB of BSS
+     actually dropped the largest block to 245 KB (the removed BSS
+     lived in a region that is not contiguous with the big pool).
+  3. `Compact dispatch enabled: 1869 unique handlers, opcode index in
+     internal SRAM` - the hot 68k dispatch is ALREADY in internal SRAM
+     via the 128 KB compact index + ~8 KB handler table. Fitting
+     cpufunctbl in internal SRAM wouldn't change the hot path; the
+     compact_dispatch path is already optimal.
+- Kept: SD HIGHSPEED (one-liner), streaming_row_buffer_a/b removal
+  (saves ~20 KB DIRAM, eliminates the dead `renderFrameStreaming`
+  path that was gated behind `DIRTY_THRESHOLD_PERCENT=101` and never
+  called), `BoardDisplay_ClearScreen` HAL helper for the init clear.
+- Reverted: `setCpuFrequencyMhz(400)` call (always fails, added noise
+  to boot log).
+
+### Takeaway
+CPU / Disk / Graphics all move together with emulated 68k MIPS. The only
+things that will lift them further are:
+- Rebuilding ESP-IDF from source with 400 MHz PMU config (biggest lever,
+  but requires abandoning pioarduino's prebuilt libs).
+- Reducing time-per-opcode in `m68k_do_execute` (LTO, inlining the RAM
+  fast path, per-opcode native fast paths, or ultimately a small JIT).
+
+The SD HIGHSPEED and streaming-buffer cleanup stay. Next exploration will
+focus on time-per-opcode.
+
+### Round 3 (2026-04-19): tried to switch to pioarduino's postv3 variant - reverted
+
+Pioarduino ships two ESP32-P4 prebuilt lib sets in
+`framework-arduinoespressif32-libs`:
+
+- `esp32p4_es/` - "Engineering Sample, pre-rev 3.00" - this is what our
+  build has been using all along via `build.chip_variant=esp32p4_es` and
+  `f_cpu=360000000L`. Clamped to 360 MHz.
+- `esp32p4/` - "v3.00 or newer" - built against `CONFIG_ESP32P4_REV_MIN_301`,
+  unlocks 400 MHz via `f_cpu=400000000L`.
+
+Arduino IDE's "ChipVariant" menu flips between them. In platformio.ini
+the same switch is `board_build.chip_variant = esp32p4` plus
+`board_build.f_cpu = 400000000L`.
+
+I flipped to the `esp32p4` variant and reflashed. The device panicked
+immediately at the bootloader entry:
+
+```
+ESP-ROM:esp32p4-eco2-20240710
+...
+Guru Meditation Error: Core 0 panic'ed (Illegal instruction)
+PC: 0x4ffac2c0   (inside the bootloader stub loaded at 0x4ffac2c0)
+```
+
+Despite the ESP-ROM banner calling our chip "esp32p4-eco2", the silicon
+in this Waveshare P4 10.1 is genuinely pre-rev 3.00 at the ISA level.
+The rev 3.01 bootloader in the `esp32p4/` lib pack uses instructions
+our chip does not implement, so it panics before reaching `main()`.
+
+Net: **400 MHz is not reachable on this specific board** without newer
+silicon. Reverted all the switch-to-postv3 changes (`platformio.ini`,
+`sdkconfig.waveshare`, `src/main.cpp`) and confirmed the device boots
+fine at 360 MHz again. Leaving the `setCpuFrequencyMhz(400)` call out
+entirely so the boot log isn't noisy with a `failed` message.
+
+The final commit from this round keeps only:
+- SD_MMC at HIGHSPEED (40 MHz negotiated)
+- Removed 40 KB of streaming buffers + dead `renderFrameStreaming`
+- New `BoardDisplay_ClearScreen` HAL helper
+
+None of which actually move the benchmark. Real gains from here will
+require either newer ESP32-P4 silicon (rev 3.01+) or per-opcode work
+inside `m68k_do_execute`.

@@ -199,6 +199,35 @@ extern "C" void BoardDisplay_PushFullFrame(const uint16_t *pixels)
     esp_lcd_panel_draw_bitmap(s_panel, 0, 0, PANEL_W, PANEL_H, pixels);
 }
 
+extern "C" void BoardDisplay_ClearScreen(uint16_t color)
+{
+    if (!s_panel) return;
+
+    /* Fill the portrait panel one horizontal strip at a time out of
+     * s_rot_buf (32 KB, ROT_BUF_PIXELS = 128*128). That's enough for
+     * an 800-wide * 20-row strip on the Waveshare panel without
+     * another internal SRAM allocation.                                */
+    const int strip_rows = ROT_BUF_PIXELS / PANEL_W;   /* 16384 / 800 = 20 */
+    if (strip_rows <= 0) return;
+
+    const size_t strip_pixels = (size_t)PANEL_W * (size_t)strip_rows;
+    for (size_t i = 0; i < strip_pixels; ++i) {
+        s_rot_buf[i] = color;
+    }
+
+    for (int y = 0; y < PANEL_H; y += strip_rows) {
+        int rows = strip_rows;
+        if (y + rows > PANEL_H) rows = PANEL_H - y;
+        claim_dma_slot();
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, PANEL_W, y + rows, s_rot_buf);
+    }
+    /* Ensure the last transfer completes before we hand control back.  */
+    if (s_dma_done) {
+        xSemaphoreTake(s_dma_done, pdMS_TO_TICKS(100));
+        xSemaphoreGive(s_dma_done);
+    }
+}
+
 /* Internal helper exposed so MiniGfx::flushAll can also gate on the
  * trans_done semaphore without needing its own knowledge of the panel. */
 extern "C" void BoardDisplay_ClaimDmaSlot(void)

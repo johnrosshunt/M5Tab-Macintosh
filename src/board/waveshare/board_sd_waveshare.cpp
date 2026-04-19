@@ -23,17 +23,29 @@ extern "C" bool BoardSD_Init(void)
 {
     if (s_mounted) return true;
 
-    ESP_LOGI(TAG, "Mounting SD card via Arduino SD_MMC (4-bit, slot 0)...");
+    ESP_LOGI(TAG, "Mounting SD card via Arduino SD_MMC (4-bit, slot 0, high-speed)...");
 
     /* SD_MMC.begin(mountpoint, mode1bit, formatOnFail, frequency, maxFiles)
-     * On P4 this also brings up the on-chip LDO that powers SD_VDD. */
+     * On P4 this also brings up the on-chip LDO that powers SD_VDD.
+     *
+     * We ask for SDMMC_FREQ_HIGHSPEED (40 MHz) - roughly double the 20 MHz
+     * SDMMC_FREQ_DEFAULT. The IDF host driver renegotiates down to a
+     * supported clock if the card doesn't advertise HS mode, so the worst
+     * case is ending up at the same 20 MHz we had before. */
     if (!SD_MMC.begin(BOARD_SD_MOUNT_POINT,
                       /* mode1bit      */ false,
                       /* formatOnFail  */ false,
-                      /* freq_khz      */ SDMMC_FREQ_DEFAULT,
+                      /* freq_khz      */ SDMMC_FREQ_HIGHSPEED,
                       /* max open files*/ 5)) {
-        ESP_LOGE(TAG, "SD_MMC.begin failed");
-        return false;
+        ESP_LOGW(TAG, "SD_MMC.begin at HIGHSPEED failed, retrying at DEFAULT (20 MHz)");
+        if (!SD_MMC.begin(BOARD_SD_MOUNT_POINT,
+                          /* mode1bit      */ false,
+                          /* formatOnFail  */ false,
+                          /* freq_khz      */ SDMMC_FREQ_DEFAULT,
+                          /* max open files*/ 5)) {
+            ESP_LOGE(TAG, "SD_MMC.begin failed at both HIGHSPEED and DEFAULT");
+            return false;
+        }
     }
 
     s_size_mb = SD_MMC.cardSize() / (1024ULL * 1024ULL);

@@ -2,9 +2,10 @@
  * @file main.cpp
  * BasiliskII ESP32 - Macintosh Emulator
  *
- * Initializes the board (display / touch / SD), runs the boot GUI, and
- * hands off to the BasiliskII emulator core. All board-specific bring-up
- * is hidden behind the small HAL in src/board/.
+ * Bring up the board + display, show the classic-Mac themed splash
+ * (tiled BgTile background + centered Happy Mac). A tap during the first
+ * 2 seconds opens the settings UI; otherwise we quietly transition into
+ * the emulator handoff.
  */
 
 #include <Arduino.h>
@@ -12,9 +13,10 @@
 #include "board.h"
 #include "board_config.h"
 #include "board_display.h"
-#include "board_sd.h"  /* pulls in SD_FS (SD on Tab5, SD_MMC on Waveshare) */
+#include "board_sd.h"          /* pulls in SD_FS (SD on Tab5, SD_MMC on Waveshare) */
 
 #include "boot_gui.h"
+#include "mac_splash.h"
 
 /* Forward declarations for BasiliskII functions */
 extern void basilisk_setup(void);
@@ -22,54 +24,11 @@ extern void basilisk_loop(void);
 extern bool basilisk_is_running(void);
 
 /* ============================================================================
- * Display helpers (cross-board)
+ * Window during which a tap anywhere opens the configuration menu. Kept
+ * short on purpose - the splash is supposed to feel seamless, not like a
+ * boot menu.
  * ==========================================================================*/
-
-/* TFT color constants we use for the startup screens. They map to the same
- * RGB565 values as LovyanGFX/M5GFX, so both backends draw the right colors. */
-#ifndef TFT_BLACK
-#define TFT_BLACK   0x0000u
-#endif
-#ifndef TFT_WHITE
-#define TFT_WHITE   0xFFFFu
-#endif
-#ifndef TFT_MAROON
-#define TFT_MAROON  0x7800u
-#endif
-
-static void showStartupScreen(void)
-{
-    auto &gfx = BoardDisplay_Gfx();
-    gfx.fillScreen(TFT_BLACK);
-    gfx.setTextColor(TFT_WHITE);
-    gfx.setTextSize(2);
-    const int cx = BoardDisplay_Width()  / 2;
-    const int cy = BoardDisplay_Height() / 2;
-    gfx.setTextDatum(MC_DATUM);
-    gfx.drawString("BasiliskII ESP32", cx, cy - 60);
-    gfx.drawString("Macintosh Emulator", cx, cy - 20);
-    gfx.setTextSize(1);
-    gfx.drawString("Initializing...", cx, cy + 40);
-#if defined(BOARD_WAVESHARE_P4_101)
-    gfx.flushAll();
-#endif
-}
-
-static void showErrorScreen(const char *error)
-{
-    auto &gfx = BoardDisplay_Gfx();
-    gfx.fillScreen(TFT_MAROON);
-    gfx.setTextColor(TFT_WHITE);
-    gfx.setTextSize(2);
-    const int cx = BoardDisplay_Width() / 2;
-    gfx.setTextDatum(MC_DATUM);
-    gfx.drawString("ERROR", cx, 100);
-    gfx.setTextSize(1);
-    gfx.drawString(error, cx, 160);
-#if defined(BOARD_WAVESHARE_P4_101)
-    gfx.flushAll();
-#endif
-}
+static const uint32_t SPLASH_TAP_WINDOW_MS = 2000;
 
 /* ============================================================================
  * SD card bring-up + ROM existence check
@@ -103,6 +62,13 @@ static bool initSDCard(void)
     return true;
 }
 
+static void haltWith(const char *msg)
+{
+    Serial.printf("[MAIN] FATAL: %s\n", msg);
+    MacSplash::ShowErrorOverlay(msg);
+    while (true) { delay(1000); }
+}
+
 /* ============================================================================
  * Setup
  * ==========================================================================*/
@@ -111,6 +77,16 @@ void setup(void)
 {
     Serial.begin(115200);
     delay(500);
+
+    /* We cannot reach 400 MHz on this Waveshare P4 10.1 in practice.
+     * pioarduino's "postv3" chip variant (which would unlock 400 MHz)
+     * ships a bootloader built for silicon revision 3.01+, and our
+     * chip (ESP-ROM "esp32p4-eco2") immediately panics with
+     * "Illegal instruction" at the bootloader entry. Verified on
+     * hardware: the stock pre-v3 prebuilt IDF is the only one that
+     * runs, and it clamps the CPU clock to 360 MHz. Leave the PMU
+     * alone - setCpuFrequencyMhz(400) would just log "failed" and
+     * add noise to the boot log.                                     */
 
     Serial.println("\n\n========================================");
     Serial.println("  BasiliskII ESP32 - Macintosh Emulator");
@@ -126,27 +102,33 @@ void setup(void)
         while (true) { delay(1000); }
     }
 
-    showStartupScreen();
-
     Serial.printf("[MAIN] Display: %dx%d\n", BoardDisplay_Width(), BoardDisplay_Height());
     Serial.printf("[MAIN] Free heap: %d bytes\n",     ESP.getFreeHeap());
     Serial.printf("[MAIN] Free PSRAM: %d bytes\n",    ESP.getFreePsram());
     Serial.printf("[MAIN] Total PSRAM: %d bytes\n",   ESP.getPsramSize());
     Serial.printf("[MAIN] CPU Freq: %d MHz\n",        ESP.getCpuFreqMHz());
 
+    /* Paint the classic-Mac splash first thing, then listen for a tap. */
+    MacSplash::Begin();
+    const bool openSettings = MacSplash::WaitForTapOrTimeout(SPLASH_TAP_WINDOW_MS);
+
+    /* SD comes up after the splash; practical init time fits comfortably
+     * inside the 2s tap window, so the icon stays visible throughout. */
     if (!initSDCard()) {
-        showErrorScreen("SD card or ROM file not found");
-        Serial.println("[MAIN] Halting - SD card initialization failed");
-        while (true) { delay(1000); }
+        haltWith("SD card or ROM file not found");
     }
 
     if (!BootGUI_Init()) {
-        showErrorScreen("Boot GUI initialization failed");
-        Serial.println("[MAIN] Halting - Boot GUI initialization failed");
-        while (true) { delay(1000); }
+        haltWith("Boot GUI initialization failed");
     }
 
-    BootGUI_Run();
+    if (openSettings) {
+        BootGUI_RunSettingsOnly();
+    } else {
+        BootGUI_FinishWithoutUI();
+    }
+
+    MacSplash::TransitionToEmulator();
 
     Serial.println("[MAIN] Starting BasiliskII emulator...");
     basilisk_setup();

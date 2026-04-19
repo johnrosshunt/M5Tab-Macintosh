@@ -125,7 +125,8 @@ static void touchTask(void* param)
     vTaskDelete(NULL);
 }
 
-// Start the touch task
+// Start the touch task (also exposed publicly as BootGUI_StartTouchTask so
+// that MacSplash can reuse the same polling task before BootGUI_Init runs).
 static bool startTouchTask(void)
 {
     if (touch_task_running) {
@@ -271,45 +272,6 @@ static int SCREEN_HEIGHT = 720;
 #define RADIO_SPACING   140
 
 // ============================================================================
-// Happy Mac Icon (32x32 pixel art)
-// ============================================================================
-
-static const uint8_t HAPPY_MAC_ICON[] = {
-    0x00, 0x0F, 0xF0, 0x00,
-    0x00, 0x3F, 0xFC, 0x00,
-    0x00, 0x7F, 0xFE, 0x00,
-    0x00, 0xFF, 0xFF, 0x00,
-    0x01, 0xFF, 0xFF, 0x80,
-    0x03, 0xFF, 0xFF, 0xC0,
-    0x07, 0xE0, 0x07, 0xE0,
-    0x07, 0xC0, 0x03, 0xE0,
-    0x0F, 0x9E, 0x79, 0xF0,
-    0x0F, 0x9E, 0x79, 0xF0,
-    0x0F, 0x80, 0x01, 0xF0,
-    0x0F, 0x80, 0x01, 0xF0,
-    0x0F, 0x8C, 0x31, 0xF0,
-    0x0F, 0x87, 0xE1, 0xF0,
-    0x07, 0xC0, 0x03, 0xE0,
-    0x07, 0xE0, 0x07, 0xE0,
-    0x03, 0xFF, 0xFF, 0xC0,
-    0x01, 0xFF, 0xFF, 0x80,
-    0x00, 0xFF, 0xFF, 0x00,
-    0x00, 0x7F, 0xFE, 0x00,
-    0x00, 0x3F, 0xFC, 0x00,
-    0x00, 0x0F, 0xF0, 0x00,
-    0x00, 0x07, 0xE0, 0x00,
-    0x00, 0x1F, 0xF8, 0x00,
-    0x00, 0x3F, 0xFC, 0x00,
-    0x00, 0x7F, 0xFE, 0x00,
-    0x00, 0x7F, 0xFE, 0x00,
-    0x00, 0x7F, 0xFE, 0x00,
-    0x00, 0x7F, 0xFE, 0x00,
-    0x00, 0x3F, 0xFC, 0x00,
-    0x00, 0x1F, 0xF8, 0x00,
-    0x00, 0x07, 0xE0, 0x00
-};
-
-// ============================================================================
 // Settings Storage
 // ============================================================================
 
@@ -369,9 +331,7 @@ static void drawButton(int x, int y, int w, int h, const char* label, bool press
 static void drawListBox(int x, int y, int w, int h, const std::vector<std::string>& items, 
                         int selected, int scroll_offset, bool include_none);
 static void drawRadioButton(int x, int y, const char* label, bool selected);
-static void drawHappyMac(int x, int y, int scale);
 static bool isPointInRect(int px, int py, int rx, int ry, int rw, int rh);
-static void runCountdownScreen(void);
 static void runSettingsScreen(void);
 static void runWiFiScreen(void);
 static void initWiFi(void);
@@ -838,28 +798,6 @@ static void drawCheckbox(int x, int y, int size, const char* label, bool checked
 }
 
 // ============================================================================
-// Drawing Functions - Happy Mac Icon
-// ============================================================================
-
-static void drawHappyMac(int x, int y, int scale)
-{
-    for (int row = 0; row < 32; row++) {
-        for (int col = 0; col < 32; col++) {
-            int byte_index = row * 4 + col / 8;
-            int bit_index = 7 - (col % 8);
-            
-            if (HAPPY_MAC_ICON[byte_index] & (1 << bit_index)) {
-                if (scale == 1) {
-                    gfx.drawPixel(x + col, y + row, MAC_BLACK);
-                } else {
-                    gfx.fillRect(x + col * scale, y + row * scale, scale, scale, MAC_BLACK);
-                }
-            }
-        }
-    }
-}
-
-// ============================================================================
 // WiFi Initialization
 // ============================================================================
 
@@ -1248,312 +1186,6 @@ static int getKeyboardHighlight(int touch_x, int touch_y, int kb_x, int kb_y, in
 static bool isPointInRect(int px, int py, int rx, int ry, int rw, int rh)
 {
     return (px >= rx && px < rx + rw && py >= ry && py < ry + rh);
-}
-
-// ============================================================================
-// Countdown Screen
-// ============================================================================
-
-static void runCountdownScreen(void)
-{
-    Serial.println("[BOOT_GUI] Showing countdown screen...");
-    Serial.printf("[BOOT_GUI] Screen size: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
-    
-    int countdown = 3;
-    int prev_countdown = -1;
-    uint32_t last_second = millis();
-    
-    // Button dimensions - HUGE and easy to tap, takes up bottom third of screen
-    int btn_w = SCREEN_WIDTH - 100;
-    int btn_h = 120;
-    int btn_x = 50;
-    int btn_y = SCREEN_HEIGHT - btn_h - 50;
-    
-    // Countdown text region (for partial updates)
-    int countdown_region_x = SCREEN_WIDTH / 2 - 250;
-    int countdown_region_y = SCREEN_HEIGHT / 2 - 110;
-    int countdown_region_w = 500;
-    int countdown_region_h = 60;
-    
-    // WiFi status region (for partial updates)
-    int wifi_region_x = SCREEN_WIDTH / 2 - 300;
-    int wifi_region_y = SCREEN_HEIGHT / 2 + 70;
-    int wifi_region_w = 600;
-    int wifi_region_h = 30;
-    
-    // "Skip WiFi" button - appears above main button when WiFi is connecting
-    int skip_btn_w = 300;
-    int skip_btn_h = 60;
-    int skip_btn_x = (SCREEN_WIDTH - skip_btn_w) / 2;
-    int skip_btn_y = btn_y - skip_btn_h - 20;
-    
-    Serial.printf("[BOOT_GUI] Button rect: x=%d y=%d w=%d h=%d (bottom edge at %d)\n", 
-                  btn_x, btn_y, btn_w, btn_h, btn_y + btn_h);
-    
-    bool button_pressed = false;
-    bool prev_button_pressed = false;
-    bool button_touch_started = false;  // Track if touch started in button
-    bool skip_pressed = false;
-    bool prev_skip_pressed = false;
-    bool skip_touch_started = false;
-    bool prev_wifi_connecting = false;  // Track when skip button appears/disappears
-    bool settings_requested = false;
-    bool first_frame = true;
-    
-    // WiFi auto-connect state
-    bool wifi_connecting = false;
-    bool wifi_connected = false;
-    bool wifi_failed = false;
-    wl_status_t prev_wifi_status = WL_IDLE_STATUS;
-    uint32_t wifi_connect_start = 0;
-    const uint32_t WIFI_TIMEOUT_MS = 10000;  // 10 second timeout
-    
-    // Start WiFi auto-connect if configured
-    // Supports both open (no password) and encrypted networks
-    if (BOOTGUI_ENABLE_WIFI_AUTOCONNECT && wifi_auto_connect && strlen(wifi_ssid) > 0) {
-        Serial.printf("[BOOT_GUI] Auto-connecting to WiFi: %s\n", wifi_ssid);
-        initWiFi();
-        if (strlen(wifi_password) > 0) {
-            WiFi.begin(wifi_ssid, wifi_password);
-        } else {
-            WiFi.begin(wifi_ssid);
-        }
-        wifi_connecting = true;
-        wifi_connect_start = millis();
-    } else if (wifi_auto_connect && strlen(wifi_ssid) > 0) {
-        Serial.println("[BOOT_GUI] WiFi auto-connect disabled by build flag");
-    }
-    
-    TouchEvent touch;
-    
-    while (countdown > 0 && !settings_requested) {
-        bool button_changed = false;
-        bool countdown_changed = false;
-        bool wifi_status_changed = false;
-        
-        // Check WiFi connection status
-        if (wifi_connecting) {
-            wl_status_t status = WiFi.status();
-            if (status != prev_wifi_status) {
-                wifi_status_changed = true;
-                prev_wifi_status = status;
-            }
-            
-            if (status == WL_CONNECTED) {
-                wifi_connecting = false;
-                wifi_connected = true;
-                wifi_status_changed = true;
-                Serial.printf("[BOOT_GUI] WiFi connected! IP: %s\n", WiFi.localIP().toString().c_str());
-            } else if (status == WL_CONNECT_FAILED || status == WL_NO_SSID_AVAIL) {
-                wifi_connecting = false;
-                wifi_failed = true;
-                wifi_status_changed = true;
-                // Stop background reconnection attempts
-                WiFi.disconnect(true);
-                Serial.println("[BOOT_GUI] WiFi connection failed");
-            } else if (millis() - wifi_connect_start > WIFI_TIMEOUT_MS) {
-                wifi_connecting = false;
-                wifi_failed = true;
-                wifi_status_changed = true;
-                // Stop background reconnection attempts
-                WiFi.disconnect(true);
-                Serial.println("[BOOT_GUI] WiFi connection timeout");
-            }
-        }
-        
-        // Get touch input from queue (non-blocking)
-        if (getTouchEvent(&touch)) {
-            // Check for new touch start
-            if (touch.was_pressed) {
-                Serial.printf("[BOOT_GUI] Touch START at (%d, %d)\n", touch.x, touch.y);
-                bool in_button = isPointInRect(touch.x, touch.y, btn_x, btn_y, btn_w, btn_h);
-                bool in_skip = wifi_connecting && isPointInRect(touch.x, touch.y, skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h);
-                Serial.printf("[BOOT_GUI] In button: %s (btn_y=%d to %d)\n", 
-                              in_button ? "YES" : "NO", btn_y, btn_y + btn_h);
-                
-                if (in_button) {
-                    button_touch_started = true;
-                    button_pressed = true;
-                    Serial.println("[BOOT_GUI] Button touch started!");
-                }
-                if (in_skip) {
-                    skip_touch_started = true;
-                    skip_pressed = true;
-                    Serial.println("[BOOT_GUI] Skip WiFi touch started!");
-                }
-            }
-            
-            // Check for touch release
-            if (touch.was_released) {
-                Serial.println("[BOOT_GUI] Touch RELEASED");
-                if (button_touch_started) {
-                    // Touch started in button and was released - trigger action
-                    settings_requested = true;
-                    Serial.println("[BOOT_GUI] Opening settings screen!");
-                }
-                if (skip_touch_started) {
-                    // Cancel WiFi connection and resume countdown
-                    Serial.println("[BOOT_GUI] Skipping WiFi connection");
-                    wifi_connecting = false;
-                    wifi_failed = true;
-                    WiFi.disconnect(true);
-                    WiFi.mode(WIFI_OFF);
-                    wifi_initialized = false;
-                }
-                button_touch_started = false;
-                button_pressed = false;
-                skip_touch_started = false;
-                skip_pressed = false;
-            }
-            
-            // Update button visual state while held
-            if (touch.is_pressed && button_touch_started) {
-                button_pressed = isPointInRect(touch.x, touch.y, btn_x, btn_y, btn_w, btn_h);
-            }
-            if (touch.is_pressed && skip_touch_started) {
-                skip_pressed = isPointInRect(touch.x, touch.y, skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h);
-            }
-        }
-        
-        // Check what changed
-        button_changed = (button_pressed != prev_button_pressed);
-        countdown_changed = (countdown != prev_countdown);
-        bool skip_btn_changed = (skip_pressed != prev_skip_pressed);
-        bool skip_btn_visibility_changed = (wifi_connecting != prev_wifi_connecting);
-        
-        // Only redraw what changed
-        if (first_frame) {
-            // First frame - draw everything
-            gfx.fillScreen(MAC_LIGHT_GRAY);
-            
-            // Draw title
-            gfx.setTextColor(MAC_BLACK);
-            gfx.setTextSize(4);
-            gfx.setTextDatum(MC_DATUM);
-            gfx.drawString("BasiliskII", SCREEN_WIDTH / 2, 100);
-            
-            // Draw settings info (static)
-            gfx.setTextSize(2);
-            if (strlen(selected_disk_path) > 0) {
-                const char* disk_name = selected_disk_path;
-                if (disk_name[0] == '/') {
-                    disk_name++;
-                }
-                char info[64];
-                sprintf(info, "Disk: %s", disk_name);
-                gfx.drawString(info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2);
-                
-                sprintf(info, "RAM: %d MB", selected_ram_mb);
-                gfx.drawString(info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 40);
-            }
-            
-            // Draw WiFi status (below settings info)
-            if (wifi_connected) {
-                char wifi_info[64];
-                sprintf(wifi_info, "WiFi: %s", WiFi.localIP().toString().c_str());
-                gfx.drawString(wifi_info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
-            } else if (wifi_failed) {
-                gfx.drawString("WiFi: Connection failed", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
-            }
-            
-            // Draw countdown text - show "WiFi Connecting..." when waiting for WiFi
-            char countdown_text[32];
-            if (wifi_connecting) {
-                sprintf(countdown_text, "WiFi Connecting...");
-            } else {
-                sprintf(countdown_text, "Starting in %d...", countdown);
-            }
-            gfx.setTextSize(4);
-            gfx.drawString(countdown_text, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 80);
-            
-            // Draw "Skip WiFi" button when WiFi is connecting
-            if (wifi_connecting) {
-                drawButton(skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h, "Skip WiFi", skip_pressed);
-            }
-            
-            // Draw button
-            drawButton(btn_x, btn_y, btn_w, btn_h, "Change Settings", button_pressed);
-            first_frame = false;
-        } else {
-            // Incremental updates - drawing directly to display
-            // Update countdown text when countdown changes OR when wifi status changes
-            if (countdown_changed || wifi_status_changed) {
-                // Clear and redraw countdown region
-                gfx.fillRect(countdown_region_x, countdown_region_y, 
-                                countdown_region_w, countdown_region_h, MAC_LIGHT_GRAY);
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(4);
-                gfx.setTextDatum(MC_DATUM);
-                char countdown_text[32];
-                if (wifi_connecting) {
-                    sprintf(countdown_text, "WiFi Connecting...");
-                } else {
-                    sprintf(countdown_text, "Starting in %d...", countdown);
-                }
-                gfx.drawString(countdown_text, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 - 80);
-            }
-            
-            if (wifi_status_changed) {
-                // Clear and redraw WiFi status region (below settings info)
-                gfx.fillRect(wifi_region_x, wifi_region_y, wifi_region_w, wifi_region_h, MAC_LIGHT_GRAY);
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(2);
-                gfx.setTextDatum(MC_DATUM);
-                
-                // Only show status line when not connecting (connecting is shown in main countdown)
-                if (wifi_connected) {
-                    char wifi_info[64];
-                    sprintf(wifi_info, "WiFi: %s", WiFi.localIP().toString().c_str());
-                    gfx.drawString(wifi_info, SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
-                } else if (wifi_failed) {
-                    gfx.drawString("WiFi: Connection failed", SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2 + 80);
-                }
-            }
-            
-            // Show/hide "Skip WiFi" button when WiFi connecting state changes
-            if (skip_btn_visibility_changed) {
-                if (wifi_connecting) {
-                    // WiFi just started connecting - draw skip button
-                    drawButton(skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h, "Skip WiFi", skip_pressed);
-                } else {
-                    // WiFi finished - erase skip button area
-                    gfx.fillRect(skip_btn_x - 5, skip_btn_y - 5, skip_btn_w + 10, skip_btn_h + 10, MAC_LIGHT_GRAY);
-                }
-            }
-            
-            // Update skip button pressed state
-            if (skip_btn_changed && wifi_connecting) {
-                drawButton(skip_btn_x, skip_btn_y, skip_btn_w, skip_btn_h, "Skip WiFi", skip_pressed);
-            }
-            
-            if (button_changed) {
-                // Redraw button
-                drawButton(btn_x, btn_y, btn_w, btn_h, "Change Settings", button_pressed);
-            }
-        }
-        
-        // Update state tracking
-        prev_button_pressed = button_pressed;
-        prev_skip_pressed = skip_pressed;
-        prev_wifi_connecting = wifi_connecting;
-        prev_countdown = countdown;
-        
-        // Update countdown - but pause while WiFi is connecting
-        if (millis() - last_second >= 1000) {
-            // Only decrement countdown if WiFi is not in the middle of connecting
-            // This gives WiFi time to connect before we boot
-            if (!wifi_connecting) {
-                countdown--;
-            }
-            last_second = millis();
-        }
-        
-        delay(1);  // Minimal delay - MIPI-DSI is fast, just yield to other tasks
-    }
-    
-    if (settings_requested) {
-        runSettingsScreen();
-    }
 }
 
 // ============================================================================
@@ -2491,21 +2123,24 @@ static void runWiFiScreen(void)
 bool BootGUI_Init(void)
 {
     Serial.println("[BOOT_GUI] Initializing...");
-    
-    // IMPORTANT: Warm up the touch panel
-    // The touch controller needs several update cycles to become responsive
-    Serial.println("[BOOT_GUI] Warming up touch panel...");
-    for (int i = 0; i < 20; i++) {
-        Board_Update();
-        delay(50);
+
+    // If MacSplash already warmed up the touch panel and started the touch
+    // task, skip the warm-up loop - it just adds ~1s of stall for no gain.
+    if (!touch_task_running) {
+        Serial.println("[BOOT_GUI] Warming up touch panel...");
+        for (int i = 0; i < 20; i++) {
+            Board_Update();
+            delay(50);
+        }
+        Serial.println("[BOOT_GUI] Touch panel ready");
+
+        if (!startTouchTask()) {
+            Serial.println("[BOOT_GUI] WARNING: Failed to start touch task, falling back to sync mode");
+        }
+    } else {
+        Serial.println("[BOOT_GUI] Touch task already running, reusing existing instance");
     }
-    Serial.println("[BOOT_GUI] Touch panel ready");
-    
-    // Start the touch polling task for responsive input
-    if (!startTouchTask()) {
-        Serial.println("[BOOT_GUI] WARNING: Failed to start touch task, falling back to sync mode");
-    }
-    
+
     // Get display dimensions from the board HAL (rotation-aware)
     SCREEN_WIDTH  = BoardDisplay_Width();
     SCREEN_HEIGHT = BoardDisplay_Height();
@@ -2516,86 +2151,126 @@ bool BootGUI_Init(void)
     // MiniGfx is fixed at RGB565 and has no setColorDepth() method.
     gfx.setColorDepth(16);
 #endif
-    
+
     // Load saved settings
     loadSettings();
-    
+
     // Scan for disk files
     scanDiskFiles();
     scanCDROMFiles();
-    
+
     // If no disk is selected but we found some, select the first one
     if (strlen(selected_disk_path) == 0 && disk_files.size() > 0) {
         strncpy(selected_disk_path, disk_files[0].c_str(), BOOT_GUI_MAX_PATH - 1);
         disk_selection_index = 0;
     }
-    
+
+    // Kick off WiFi auto-connect in the background if configured. The
+    // previous countdown screen used to block on this; now we just fire
+    // it off and let it land whenever - the emulator doesn't need it up
+    // at boot, and the settings screen can always show the live status.
+    if (BOOTGUI_ENABLE_WIFI_AUTOCONNECT && wifi_auto_connect && strlen(wifi_ssid) > 0) {
+        Serial.printf("[BOOT_GUI] Auto-connecting to WiFi: %s\n", wifi_ssid);
+        initWiFi();
+        if (strlen(wifi_password) > 0) {
+            WiFi.begin(wifi_ssid, wifi_password);
+        } else {
+            WiFi.begin(wifi_ssid);
+        }
+    } else if (wifi_auto_connect && strlen(wifi_ssid) > 0) {
+        Serial.println("[BOOT_GUI] WiFi auto-connect disabled by build flag");
+    }
+
     gui_initialized = true;
     Serial.println("[BOOT_GUI] Initialization complete");
-    
+
     return true;
 }
 
-void BootGUI_Run(void)
+// Shared WiFi cleanup path - used at the end of either settings or the
+// silent (no-tap) boot flow. Leaves WiFi up if the user configured it and
+// it actually connected; otherwise powers it down to free runtime state.
+static void bootGuiCleanupWifi(void)
+{
+    if (!wifi_initialized) {
+        return;
+    }
+    WiFi.scanDelete();
+    wl_status_t status = WiFi.status();
+    if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
+        Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        delay(100);
+        wifi_initialized = false;
+        Serial.println("[BOOT_GUI] WiFi cleanup complete");
+    } else {
+        Serial.printf("[BOOT_GUI] WiFi connected, keeping connection (IP: %s)\n",
+                     WiFi.localIP().toString().c_str());
+    }
+}
+
+void BootGUI_RunSettingsOnly(void)
 {
     if (!gui_initialized) {
         Serial.println("[BOOT_GUI] ERROR: GUI not initialized");
         return;
     }
-    
-    // Check if we should skip the GUI
+
+    // /basilisk_settings.txt "skip_gui=yes" still honored - just short-
+    // circuit the settings UI and clean up WiFi / touch task.
     if (skip_gui) {
-        Serial.println("[BOOT_GUI] skip_gui=yes, skipping boot GUI");
-        Serial.printf("[BOOT_GUI] Using saved settings: disk=%s, ram=%dMB\n", 
+        Serial.println("[BOOT_GUI] skip_gui=yes, skipping settings screen");
+        Serial.printf("[BOOT_GUI] Using saved settings: disk=%s, ram=%dMB\n",
                       selected_disk_path, selected_ram_mb);
-        
-        // Stop the touch task before returning to emulator
         stopTouchTask();
-        
-        // Clean up WiFi unless we explicitly keep it for emulator networking.
-        if (wifi_initialized) {
-            WiFi.scanDelete();
-            wl_status_t status = WiFi.status();
-            if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
-                Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
-                WiFi.disconnect(true);
-                WiFi.mode(WIFI_OFF);
-                delay(100);
-                wifi_initialized = false;
-            }
-        }
+        bootGuiCleanupWifi();
         return;
     }
-    
-    Serial.println("[BOOT_GUI] Running boot GUI...");
-    
-    // Run countdown screen (may transition to settings screen)
-    runCountdownScreen();
-    
+
+    Serial.println("[BOOT_GUI] Running settings screen...");
+    runSettingsScreen();
+
     // Stop the touch task before returning to emulator (emulator has its own input task)
     stopTouchTask();
-    
-    // Clean up WiFi unless we explicitly keep it for emulator networking.
-    // This prevents any lingering WiFi state from consuming runtime resources.
-    if (wifi_initialized) {
-        // Cancel any in-progress scan
-        WiFi.scanDelete();
-        
-        wl_status_t status = WiFi.status();
-        if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
-            Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
-            WiFi.disconnect(true);  // Disconnect and turn off WiFi
-            WiFi.mode(WIFI_OFF);
-            delay(100);  // Give WiFi time to clean up
-            wifi_initialized = false;  // Mark as uninitialized
-            Serial.println("[BOOT_GUI] WiFi cleanup complete");
-        } else {
-            Serial.printf("[BOOT_GUI] WiFi connected, keeping connection (IP: %s)\n", 
-                         WiFi.localIP().toString().c_str());
-        }
-    }
-    
-    Serial.println("[BOOT_GUI] Boot GUI complete, proceeding to emulator");
+    bootGuiCleanupWifi();
+
+    Serial.println("[BOOT_GUI] Settings complete, proceeding to emulator");
+}
+
+void BootGUI_FinishWithoutUI(void)
+{
+    Serial.println("[BOOT_GUI] Finishing without settings UI");
+    stopTouchTask();
+    bootGuiCleanupWifi();
+}
+
+// --------------------------------------------------------------------------
+// Public touch-task hooks - thin wrappers around the static helpers so
+// MacSplash can reuse the same 60 Hz polling task without duplicating it.
+// --------------------------------------------------------------------------
+
+bool BootGUI_StartTouchTask(void)
+{
+    return startTouchTask();
+}
+
+void BootGUI_StopTouchTask(void)
+{
+    stopTouchTask();
+}
+
+bool BootGUI_PollTouch(BootGUITouch *out)
+{
+    if (!out) return false;
+    TouchEvent evt;
+    if (!getTouchEvent(&evt)) return false;
+    out->x            = evt.x;
+    out->y            = evt.y;
+    out->is_pressed   = evt.is_pressed;
+    out->was_pressed  = evt.was_pressed;
+    out->was_released = evt.was_released;
+    return true;
 }
 
 const char* BootGUI_GetDiskPath(void)

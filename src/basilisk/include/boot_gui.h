@@ -22,15 +22,52 @@
  *  Initialize the boot GUI system
  *  Must be called after SD card is initialized
  *  Returns true on success
+ *
+ *  If the touch task is already running (for example because MacSplash
+ *  started it earlier), BootGUI_Init leaves it alone instead of starting
+ *  a second one.
  */
 bool BootGUI_Init(void);
 
 /*
- *  Run the boot GUI
- *  Shows countdown screen, then settings screen if user interacts
- *  Returns when user chooses to boot (either by countdown or Boot button)
+ *  Run the full-screen settings UI. Returns when the user taps Boot
+ *  (or the GUI-skip flag in /basilisk_settings.txt is set). Also stops
+ *  the shared touch task and settles WiFi before returning.
  */
-void BootGUI_Run(void);
+void BootGUI_RunSettingsOnly(void);
+
+/*
+ *  Clean up without showing the settings UI. Used when the pre-boot
+ *  splash times out with no tap - we still need to stop the touch task
+ *  (so the emulator's input task owns the touch panel) and settle any
+ *  in-flight WiFi auto-connect the same way BootGUI_RunSettingsOnly
+ *  would have.
+ */
+void BootGUI_FinishWithoutUI(void);
+
+/* ------------------------------------------------------------------- */
+/* Shared touch-task infrastructure. MacSplash reuses this so the same  */
+/* 60 Hz polling task handles the pre-boot splash tap AND the settings  */
+/* screen without being torn down and re-created in between.            */
+/* ------------------------------------------------------------------- */
+
+typedef struct {
+    int  x;
+    int  y;
+    bool is_pressed;
+    bool was_pressed;   /* rising edge since last poll */
+    bool was_released;  /* falling edge since last poll */
+} BootGUITouch;
+
+bool BootGUI_StartTouchTask(void);
+void BootGUI_StopTouchTask(void);
+
+/*
+ *  Peek the most recent touch event. Returns false if the task is not
+ *  running or no event is available. Consuming an event clears its
+ *  edge flags so callers see each press/release exactly once.
+ */
+bool BootGUI_PollTouch(BootGUITouch *out);
 
 /*
  *  Get the selected hard disk path

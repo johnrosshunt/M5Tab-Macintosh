@@ -31,6 +31,15 @@ void BoardDisplay_EndTiles(void);
 void BoardDisplay_PushTile(int x, int y, int w, int h, const uint16_t *pixels);
 void BoardDisplay_WaitPush(void);
 void BoardDisplay_PushFullFrame(const uint16_t *pixels);
+
+/**
+ * @brief Paint the full display with a single RGB565 color.
+ *
+ *  Used by the video subsystem to blank the screen on init. The HAL
+ *  picks whatever scratch buffer or fill primitive is cheapest on the
+ *  current board. Does not require a prior BeginTiles/EndTiles pair.
+ */
+void BoardDisplay_ClearScreen(uint16_t color);
 void BoardDisplay_FillRect(int x, int y, int w, int h, uint16_t color);
 void BoardDisplay_SetBacklight(int percent);
 
