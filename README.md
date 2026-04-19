@@ -1,6 +1,15 @@
-# BasiliskII ESP32 — Classic Macintosh Emulator for M5Stack Tab5
+# BasiliskII ESP32 — Classic Macintosh Emulator
 
-A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4 microcontroller, running on the M5Stack Tab5 hardware. This project brings classic Mac OS (System 7.x through Mac OS 8.1) to a portable embedded device with touchscreen input and USB peripheral support.
+A full port of the **BasiliskII** Macintosh 68k emulator to the ESP32-P4, bringing classic Mac OS (System 7.x through Mac OS 8.1) to portable embedded devices with touchscreen and USB peripheral support.
+
+Two boards are currently supported from the same source tree:
+
+| Board                                                                                              | Display           | Mac screen | PlatformIO env        |
+|----------------------------------------------------------------------------------------------------|-------------------|-----------:|-----------------------|
+| [M5Stack Tab5](https://shop.m5stack.com/products/m5stack-tab5-iot-development-kit-esp32-p4)        | 5" 1280x720       | 640x360 @ 2x | `esp32p4_pioarduino` |
+| [Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1](https://www.waveshare.com/esp32-p4-wifi6-touch-lcd-7-8-10.1.htm) | 10.1" 800x1280 (rotated to 1280x800 landscape) | 640x400 @ 2x | `waveshare_p4_101`   |
+
+Both variants share the BasiliskII core, video pipeline, USB HID handling, and boot GUI. Per-board drivers live behind a thin HAL in [`src/board/`](src/board/); see [`docs/waveshare/README.md`](docs/waveshare/README.md) for the Waveshare-specific pin map and notes.
 
 
 ---
@@ -268,6 +277,20 @@ dd if=/dev/zero of=Macintosh.dsk bs=1M count=500
 Then format it during Mac OS installation.
 
 ### Flashing the Firmware
+
+Pick the environment that matches your hardware:
+
+- M5Stack Tab5 -> `esp32p4_pioarduino`
+- Waveshare P4 10.1" -> `waveshare_p4_101`
+
+The resulting merged binary lands in `release/M5Tab-Macintosh.bin` regardless of env.
+
+```bash
+pio run -e esp32p4_pioarduino     # Tab5
+pio run -e waveshare_p4_101       # Waveshare
+```
+
+See [`docs/waveshare/README.md`](docs/waveshare/README.md) for the Waveshare pin map and BSP notes.
 
 #### Option 1: Pre-built Firmware (Easiest)
 

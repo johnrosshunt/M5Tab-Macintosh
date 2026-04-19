@@ -15,7 +15,7 @@
 #include "prefs.h"
 #include "sys.h"
 
-#include <SD.h>
+#include "board_sd.h"  /* SD_FS alias (SD on Tab5, SD_MMC on Waveshare) */
 #include <FS.h>
 
 #define DEBUG 0
@@ -159,7 +159,7 @@ static void Sys_repair_hfs_volume(const char *path)
     
     Serial.printf("[SYS] Checking HFS volume: %s\n", path);
     
-    File f = SD.open(path, "r+b");
+    File f = SD_FS.open(path, "r+b");
     if (!f) {
         return;
     }
@@ -269,11 +269,11 @@ void *Sys_open(const char *name, bool read_only, bool is_cdrom)
     
     // Open file
     if (fh->read_only) {
-        fh->file = SD.open(name, FILE_READ);
+        fh->file = SD_FS.open(name, FILE_READ);
     } else {
-        fh->file = SD.open(name, "r+b");
+        fh->file = SD_FS.open(name, "r+b");
         if (!fh->file) {
-            fh->file = SD.open(name, FILE_READ);
+            fh->file = SD_FS.open(name, FILE_READ);
             fh->read_only = true;
         }
     }

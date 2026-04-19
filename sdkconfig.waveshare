@@ -1,0 +1,44 @@
+# Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1 sdkconfig overrides
+#
+# These Kconfig settings are merged on top of the pioarduino Arduino defaults
+# when building the [env:waveshare_p4_101] environment. They configure the
+# Waveshare BSP (panel selection, SD mount point, color format) and enable
+# the P4-specific features we rely on (MIPI-DSI, SDMMC host, etc.).
+
+# Target selection
+CONFIG_IDF_TARGET="esp32p4"
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_1=y
+
+# Performance defaults matching the Waveshare example configs
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# --- Waveshare BSP: esp32_p4_wifi6_touch_lcd_x ---
+# I2C fast mode (400 kHz) for codec + touch
+CONFIG_BSP_I2C_NUM=1
+CONFIG_BSP_I2C_FAST_MODE=y
+CONFIG_BSP_I2C_CLK_SPEED_HZ=400000
+
+# Use I2S1 for audio (port 0 is reserved on some builds)
+CONFIG_BSP_I2S_NUM=1
+
+# Mount the microSD at /sd so existing application code (which references
+# paths like "/Q650.ROM") keeps working without change.
+CONFIG_BSP_SD_MOUNT_POINT="/sd"
+CONFIG_BSP_SD_FORMAT_ON_MOUNT_FAIL=n
+
+# LCD: 10.1" Waveshare panel, RGB565 for bandwidth, 3 frame buffers for
+# tear-free DMA, LEDC channel 1 for backlight PWM.
+CONFIG_BSP_LCD_TYPE_800_1280_10_1_INCH=y
+CONFIG_BSP_LCD_COLOR_FORMAT_RGB565=y
+CONFIG_BSP_LCD_DPI_BUFFER_NUMS=3
+CONFIG_BSP_DISPLAY_BRIGHTNESS_LEDC_CH=1
+
+# SPIFFS defaults (unused, but keep the symbols defined)
+CONFIG_BSP_SPIFFS_MOUNT_POINT="/spiffs"
+CONFIG_BSP_SPIFFS_PARTITION_LABEL="storage"
+CONFIG_BSP_SPIFFS_MAX_FILES=5
+CONFIG_BSP_SPIFFS_FORMAT_ON_MOUNT_FAIL=n

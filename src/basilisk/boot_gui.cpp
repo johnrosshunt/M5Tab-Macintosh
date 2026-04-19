@@ -15,9 +15,10 @@
  */
 
 #include <Arduino.h>
+#if defined(BOARD_M5STACK_TAB5)
 #include <M5Unified.h>
 #include <M5GFX.h>
-#include <SD.h>
+#endif
 #include <WiFi.h>
 #include <vector>
 #include <string>
@@ -26,18 +27,12 @@
 #include <freertos/queue.h>
 
 #include "boot_gui.h"
-
-// ============================================================================
-// WiFi SDIO Pins for ESP32-C6 Communication
-// ============================================================================
-
-#define WIFI_SDIO_CLK  GPIO_NUM_12
-#define WIFI_SDIO_CMD  GPIO_NUM_13
-#define WIFI_SDIO_D0   GPIO_NUM_11
-#define WIFI_SDIO_D1   GPIO_NUM_10
-#define WIFI_SDIO_D2   GPIO_NUM_9
-#define WIFI_SDIO_D3   GPIO_NUM_8
-#define WIFI_SDIO_RST  GPIO_NUM_15
+#include "board.h"
+#include "board_config.h"
+#include "board_display.h"
+#include "board_touch.h"
+#include "board_wifi.h"
+#include "board_sd.h"  /* SD_FS alias */
 
 // Balanced defaults: auto-connect and keep WiFi for emulator networking.
 #ifndef BOOTGUI_ENABLE_WIFI_AUTOCONNECT
@@ -85,16 +80,22 @@ static void touchTask(void* param)
     bool local_prev_pressed = false;
     
     while (touch_task_running) {
-        // Update M5 to poll touch controller
-        M5.update();
-        
-        auto touch = M5.Touch.getDetail();
-        bool current_pressed = touch.isPressed();
-        
+        // Refresh the board's cached touch state
+        Board_Update();
+
+        // Push any pending framebuffer updates to the panel. On Tab5 this
+        // is a no-op because M5.Display writes are synchronous; on
+        // Waveshare it flushes the MiniGfx PSRAM framebuffer to the
+        // MIPI-DSI back buffer so the user sees fresh redraws.
+        BoardDisplay_Present();
+
+        BoardTouchDetail touch = BoardTouch_GetDetail();
+        bool current_pressed = touch.pressed;
+
         // Detect edges ourselves (don't rely on M5's edge detection)
         bool just_pressed = current_pressed && !local_prev_pressed;
         bool just_released = !current_pressed && local_prev_pressed;
-        
+
         // Fill event structure
         evt.x = touch.x;
         evt.y = touch.y;
@@ -346,10 +347,13 @@ static int cdrom_scroll_offset = 0;
 
 static bool gui_initialized = false;
 
-// Macro to draw directly to display (no canvas buffer needed)
-// This writes directly to the display framebuffer via DMA, which is much faster
-// than using a PSRAM canvas and then pushing the whole thing
-#define gfx M5.Display
+// Alias to the board's drawing surface:
+//   Tab5: M5.Display (LovyanGFX / M5GFX - writes straight to the panel)
+//   Waveshare: MiniGfx software framebuffer that flushes via MIPI-DSI
+//
+// Both types expose the same fillRect / drawRect / drawString /
+// drawFastHLine / ... method names this file relies on.
+#define gfx BoardDisplay_Gfx()
 
 // ============================================================================
 // Forward Declarations
@@ -383,7 +387,7 @@ static void loadSettings(void)
 {
     Serial.println("[BOOT_GUI] Loading settings...");
     
-    File file = SD.open(SETTINGS_FILE, FILE_READ);
+    File file = SD_FS.open(SETTINGS_FILE, FILE_READ);
     if (!file) {
         Serial.println("[BOOT_GUI] No settings file found, using defaults");
         return;
@@ -442,11 +446,11 @@ static void saveSettings(void)
     Serial.println("[BOOT_GUI] Saving settings...");
 
     // Rewrite file from scratch to avoid stale duplicate keys across boots.
-    if (SD.exists(SETTINGS_FILE)) {
-        SD.remove(SETTINGS_FILE);
+    if (SD_FS.exists(SETTINGS_FILE)) {
+        SD_FS.remove(SETTINGS_FILE);
     }
 
-    File file = SD.open(SETTINGS_FILE, FILE_WRITE);
+    File file = SD_FS.open(SETTINGS_FILE, FILE_WRITE);
     if (!file) {
         Serial.println("[BOOT_GUI] ERROR: Cannot open settings file for writing");
         return;
@@ -487,7 +491,7 @@ static void scanDiskFiles(void)
     Serial.println("[BOOT_GUI] Scanning for disk images...");
     disk_files.clear();
     
-    File root = SD.open("/");
+    File root = SD_FS.open("/");
     if (!root) {
         Serial.println("[BOOT_GUI] ERROR: Cannot open SD root");
         return;
@@ -539,7 +543,7 @@ static void scanCDROMFiles(void)
     Serial.println("[BOOT_GUI] Scanning for CD-ROM images...");
     cdrom_files.clear();
     
-    File root = SD.open("/");
+    File root = SD_FS.open("/");
     if (!root) {
         Serial.println("[BOOT_GUI] ERROR: Cannot open SD root");
         return;
@@ -866,11 +870,11 @@ static void initWiFi(void)
     }
     
     Serial.println("[BOOT_GUI] Initializing WiFi...");
-    
-    // Set up SDIO pins for ESP32-C6 communication
-    // This is required before any WiFi operations on Tab5
-    WiFi.setPins(WIFI_SDIO_CLK, WIFI_SDIO_CMD, WIFI_SDIO_D0, 
-                 WIFI_SDIO_D1, WIFI_SDIO_D2, WIFI_SDIO_D3, WIFI_SDIO_RST);
+
+    // Configure the board-specific WiFi transport:
+    //   - Tab5: hard-coded SDIO2 pins to the ESP32-C6 via WiFi.setPins()
+    //   - Waveshare: no-op (esp_wifi_remote / esp_hosted auto-configures)
+    BoardWifi_Prepare();
     
     // Set WiFi mode to station
     WiFi.mode(WIFI_STA);
@@ -2492,7 +2496,7 @@ bool BootGUI_Init(void)
     // The touch controller needs several update cycles to become responsive
     Serial.println("[BOOT_GUI] Warming up touch panel...");
     for (int i = 0; i < 20; i++) {
-        M5.update();
+        Board_Update();
         delay(50);
     }
     Serial.println("[BOOT_GUI] Touch panel ready");
@@ -2502,14 +2506,16 @@ bool BootGUI_Init(void)
         Serial.println("[BOOT_GUI] WARNING: Failed to start touch task, falling back to sync mode");
     }
     
-    // Get display dimensions
-    SCREEN_WIDTH = M5.Display.width();
-    SCREEN_HEIGHT = M5.Display.height();
+    // Get display dimensions from the board HAL (rotation-aware)
+    SCREEN_WIDTH  = BoardDisplay_Width();
+    SCREEN_HEIGHT = BoardDisplay_Height();
     Serial.printf("[BOOT_GUI] Display size: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
-    
-    // Drawing directly to display framebuffer - no canvas needed
-    // This is much faster than using a PSRAM canvas + pushSprite
+
+#if defined(BOARD_M5STACK_TAB5)
+    // LovyanGFX-specific: set 16-bit color depth for fastest DMA path.
+    // MiniGfx is fixed at RGB565 and has no setColorDepth() method.
     gfx.setColorDepth(16);
+#endif
     
     // Load saved settings
     loadSettings();

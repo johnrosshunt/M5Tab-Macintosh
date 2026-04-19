@@ -1,6 +1,16 @@
-# M5Stack Tab5 Board Configuration
+# Supported Board Configurations
 
-## Overview
+This document describes the pin maps for each board that can be built from this
+tree. Pick the PlatformIO env that matches your hardware:
+
+| Board                                           | env                    | Pin map         |
+|-------------------------------------------------|------------------------|-----------------|
+| M5Stack Tab5                                    | `esp32p4_pioarduino`   | See below       |
+| Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1         | `waveshare_p4_101`     | [docs/waveshare/README.md](docs/waveshare/README.md) |
+
+## M5Stack Tab5
+
+### Overview
 
 The M5Stack Tab5 (SKU: C145/K145) is a highly expandable, portable smart-IoT terminal development device featuring a **dual-chip architecture**.
 
@@ -207,3 +217,82 @@ M5.Display.println("Hello World");
 - [M5Unified Library](https://github.com/M5Stack/M5Unified)
 - [M5GFX Library](https://github.com/M5Stack/M5GFX)
 - [Tab5 Schematics PDF](https://docs.m5stack.com/en/core/Tab5#schematic)
+
+---
+
+## Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1
+
+### Overview
+
+The [Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1](https://www.waveshare.com/esp32-p4-wifi6-touch-lcd-7-8-10.1.htm) is a 10.1" HMI development board built around the same ESP32-P4 + ESP32-C6 dual-chip architecture as the Tab5. It is supported by the `waveshare_p4_101` PlatformIO env.
+
+### Display
+
+- **Size**: 10.1 inches
+- **Resolution**: 800 x 1280 (portrait native), rotated 90 degrees in software to present 1280 x 800 landscape
+- **Driver**: JD9365 over 2-lane MIPI-DSI @ 1500 Mbps per lane
+- **Backlight**: GPIO26, driven by LEDC PWM (5 kHz, 10-bit)
+- **Reset**: GPIO27
+- **Touch**: GT911/GT9271 on I2C (auto-detected at 0x5D or 0x14)
+
+### Audio
+
+- **Codec**: ES8311 (not the ES8388 used on Tab5)
+- **AEC frontend**: ES7210 (same chip as Tab5; 4-mic capable but only dual mics populated)
+- **Amplifier**: NS4150B (same chip as Tab5)
+- **I2S pins**: MCLK=GPIO13, BCLK=GPIO12, WS=GPIO10, DOUT=GPIO9, DSIN=GPIO11
+- **Amp enable**: GPIO53 (active high)
+
+### I2C Bus (shared)
+
+| Signal | GPIO |
+|--------|------|
+| SDA    | GPIO7 |
+| SCL    | GPIO8 |
+
+Clients on this bus: ES8311 codec, ES7210 mic frontend, GT911 touch controller.
+
+### microSD Card (SDMMC 4-bit, slot 0)
+
+| Signal | GPIO  |
+|--------|-------|
+| CLK    | GPIO43 |
+| CMD    | GPIO44 |
+| D0     | GPIO39 |
+| D1     | GPIO40 |
+| D2     | GPIO41 |
+| D3     | GPIO42 |
+
+Card VDD is supplied by the on-chip LDO channel 4 (configured by the BSP).
+Mount point is `/sd` (set via `CONFIG_BSP_SD_MOUNT_POINT` in [sdkconfig.waveshare](sdkconfig.waveshare)).
+
+### WiFi
+
+WiFi 6 is routed through an ESP32-C6 co-processor using the stock
+`esp_wifi_remote` + `esp_hosted` path shipped with Arduino-ESP32 3.3.x. No
+manual `WiFi.setPins()` call is needed - the SDIO pin map is owned by the
+`esp_hosted` component. The boot-time WiFi UX in
+[src/basilisk/boot_gui.cpp](src/basilisk/boot_gui.cpp) is unchanged; the
+`BoardWifi_Prepare()` hook in
+[src/board/waveshare/board_wifi_waveshare.cpp](src/board/waveshare/board_wifi_waveshare.cpp)
+is intentionally a no-op.
+
+### Software stack
+
+The Waveshare build uses the Espressif vendored drivers directly (not
+M5Unified/M5GFX, which do not support this board):
+
+- [`lib/esp32_p4_wifi6_touch_lcd_x/`](lib/esp32_p4_wifi6_touch_lcd_x/) - Waveshare's own BSP (display + touch + audio + SD + USB host helpers)
+- [`lib/esp_lcd_jd9365/`](lib/esp_lcd_jd9365/) - MIPI-DSI panel driver
+- [`lib/esp_lcd_touch/`](lib/esp_lcd_touch/) + [`lib/esp_lcd_touch_gt911/`](lib/esp_lcd_touch_gt911/) - GT911 touch driver
+- [`lib/esp_codec_dev/`](lib/esp_codec_dev/) - ES8311/ES7210 codec abstraction
+
+A small in-tree RGB565 renderer ([`src/board/waveshare/mini_gfx.cpp`](src/board/waveshare/mini_gfx.cpp))
+provides the drawing primitives the boot GUI needs, plus the landscape->portrait
+coordinate rotation required to drive the panel at its native portrait resolution.
+
+### Resources
+
+- [Product page](https://www.waveshare.com/esp32-p4-wifi6-touch-lcd-7-8-10.1.htm)
+- [Waveshare docs](https://docs.waveshare.com/ESP32-P4-WIFI6-Touch-LCD-X)
+- [Waveshare-ESP32-components on GitHub](https://github.com/waveshareteam/Waveshare-ESP32-components)

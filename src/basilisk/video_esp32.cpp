@@ -32,8 +32,13 @@
 #include "video.h"
 #include "video_defs.h"
 
+#include "board_config.h"
+#include "board_display.h"
+
+#if defined(BOARD_M5STACK_TAB5)
 #include <M5Unified.h>
 #include <M5GFX.h>
+#endif
 
 // FreeRTOS for dual-core support
 #include "freertos/FreeRTOS.h"
@@ -64,25 +69,24 @@
 #define VIDEO_DIRTY_MARK_NOOP 0
 #endif
 
-// Display configuration - 640x360 with 2x pixel doubling for 1280x720 display
-#define MAC_SCREEN_WIDTH  640
-#define MAC_SCREEN_HEIGHT 360
+// Display configuration is board-specific (see src/board/board_config.h).
+// Tab5: 640x360 Mac @ 2x = 1280x720. Waveshare: 640x400 Mac @ 2x = 1280x800.
+#define MAC_SCREEN_WIDTH  BOARD_MAC_SCREEN_WIDTH
+#define MAC_SCREEN_HEIGHT BOARD_MAC_SCREEN_HEIGHT
 #define MAC_SCREEN_DEPTH  VDEPTH_8BIT  // 8-bit indexed color
-#define PIXEL_SCALE       2            // 2x scaling to fill 1280x720
+#define PIXEL_SCALE       BOARD_PIXEL_SCALE
 
-// Physical display dimensions
-#define DISPLAY_WIDTH     1280
-#define DISPLAY_HEIGHT    720
+// Physical display dimensions (post pixel-doubling)
+#define DISPLAY_WIDTH     BOARD_DISPLAY_WIDTH
+#define DISPLAY_HEIGHT    BOARD_DISPLAY_HEIGHT
 
-// Tile-based dirty tracking configuration
-// Tile size: 40x40 Mac pixels (80x80 display pixels after 2x scaling)
-// Grid: 16 columns x 9 rows = 144 tiles total
-// Coverage: 640x360 exactly (40*16=640, 40*9=360)
-#define TILE_WIDTH        40
-#define TILE_HEIGHT       40
-#define TILES_X           16
-#define TILES_Y           9
-#define TOTAL_TILES       (TILES_X * TILES_Y)  // 144 tiles
+// Tile-based dirty tracking. Grid dims come from board_config.h so each
+// board gets a 16x(N) grid that tiles its Mac framebuffer exactly.
+#define TILE_WIDTH        BOARD_TILE_WIDTH
+#define TILE_HEIGHT       BOARD_TILE_HEIGHT
+#define TILES_X           BOARD_TILES_X
+#define TILES_Y           BOARD_TILES_Y
+#define TOTAL_TILES       (TILES_X * TILES_Y)
 
 // Dirty tile threshold - if more than this percentage of tiles are dirty,
 // do a full update instead of partial
@@ -198,17 +202,27 @@ public:
 static ESP32_monitor_desc *the_monitor = NULL;
 
 /*
- *  Convert RGB888 to swap565 format for M5GFX writePixels
- *  
- *  M5GFX uses byte-swapped RGB565 (swap565_t):
- *  - Low byte:  RRRRRGGG (R5 in bits 7-3, G high 3 bits in bits 2-0)
- *  - High byte: GGGBBBBB (G low 3 bits in bits 7-5, B5 in bits 4-0)
+ *  Convert RGB888 to the RGB565 layout expected by the board's display stack.
+ *
+ *  - Tab5 (M5GFX): byte-swapped RGB565 (swap565_t). M5GFX's writePixelsDMA
+ *    reads two bytes per pixel in this exact order; returning native RGB565
+ *    produces a green/blue/red swap on the Tab5 panel.
+ *  - Waveshare (esp_lcd_panel_draw_bitmap): native little-endian RGB565
+ *    (standard R:5 G:6 B:5 packing). Returning the swap565 value here
+ *    produces a greenish cast.
  */
+#if defined(BOARD_WAVESHARE_P4_101)
+static inline uint16 rgb888_to_rgb565(uint8 r, uint8 g, uint8 b)
+{
+    return (uint16)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+}
+#else
 static inline uint16 rgb888_to_rgb565(uint8 r, uint8 g, uint8 b)
 {
     // swap565 format: matches M5GFX's internal swap565() function
     return ((r >> 3) << 3 | (g >> 5)) | (((g >> 2) << 5 | (b >> 3)) << 8);
 }
+#endif
 
 /*
  *  Set palette for indexed color modes
@@ -309,17 +323,25 @@ static void initTileLuts(void)
  */
 static void initDefaultPalette(video_depth depth)
 {
+    /* Keep Serial.println OUT of the critical section. The spinlock is
+     * taken on the calling core AND blocks the opposite core when it
+     * attempts to read the palette in the video render path. If we
+     * printed from inside the critical section, a UART TX stall would
+     * starve the other core's interrupt watchdog and panic CPU0.
+     * We only log which path we took after the critical section exits. */
+    const char *log_msg = NULL;
+
     portENTER_CRITICAL(&frame_spinlock);
-    
+
     switch (depth) {
         case VDEPTH_1BIT:
             // 1-bit: Black and white
             // Index 0 = white, Index 1 = black
             palette_rgb565[0] = rgb888_to_rgb565(255, 255, 255);  // White
             palette_rgb565[1] = rgb888_to_rgb565(0, 0, 0);        // Black
-            Serial.println("[VIDEO] Initialized 1-bit B&W palette");
+            log_msg = "[VIDEO] Initialized 1-bit B&W palette";
             break;
-            
+
         case VDEPTH_2BIT:
             // 2-bit: 4 levels of gray
             // Index 0 = white, Index 3 = black
@@ -327,9 +349,9 @@ static void initDefaultPalette(video_depth depth)
             palette_rgb565[1] = rgb888_to_rgb565(170, 170, 170);  // Light gray
             palette_rgb565[2] = rgb888_to_rgb565(85, 85, 85);     // Dark gray
             palette_rgb565[3] = rgb888_to_rgb565(0, 0, 0);        // Black
-            Serial.println("[VIDEO] Initialized 2-bit grayscale palette");
+            log_msg = "[VIDEO] Initialized 2-bit grayscale palette";
             break;
-            
+
         case VDEPTH_4BIT:
             // 4-bit: Classic Mac 16-color palette
             // This matches the standard Mac 16-color CLUT
@@ -356,7 +378,7 @@ static void initDefaultPalette(video_depth depth)
                     palette_rgb565[i] = rgb888_to_rgb565(mac16[i][0], mac16[i][1], mac16[i][2]);
                 }
             }
-            Serial.println("[VIDEO] Initialized 4-bit 16-color palette");
+            log_msg = "[VIDEO] Initialized 4-bit 16-color palette";
             break;
             
         case VDEPTH_8BIT:
@@ -387,12 +409,16 @@ static void initDefaultPalette(video_depth depth)
                     palette_rgb565[idx++] = rgb888_to_rgb565(gray, gray, gray);
                 }
             }
-            Serial.println("[VIDEO] Initialized 8-bit 256-color palette");
+            log_msg = "[VIDEO] Initialized 8-bit 256-color palette";
             break;
     }
-    
+
     portEXIT_CRITICAL(&frame_spinlock);
-    
+
+    if (log_msg) {
+        Serial.println(log_msg);
+    }
+
     // Force a full screen update since palette changed
     force_full_update = true;
 }
@@ -890,8 +916,8 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
     int tiles_rendered = 0;
     bool dma_pending = false;
     
-    M5.Display.startWrite();
-    
+    BoardDisplay_BeginTiles();
+
     for (int ty = 0; ty < TILES_Y; ty++) {
         for (int tx = 0; tx < TILES_X; tx++) {
             int tile_idx = ty * TILES_X + tx;
@@ -920,7 +946,7 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
             
             // STEP 5: Wait for any pending DMA before using its buffer
             if (dma_pending) {
-                M5.Display.waitDMA();
+                BoardDisplay_WaitPush();
                 dma_pending = false;
             }
             
@@ -928,8 +954,9 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
             int dst_start_x = tx * tile_pixel_width;
             int dst_start_y = ty * tile_pixel_height;
             
-            M5.Display.setAddrWindow(dst_start_x, dst_start_y, tile_pixel_width, tile_pixel_height);
-            M5.Display.writePixelsDMA(current_buffer, tile_pixel_width * tile_pixel_height);
+            BoardDisplay_PushTile(dst_start_x, dst_start_y,
+                                  tile_pixel_width, tile_pixel_height,
+                                  current_buffer);
             dma_pending = true;
             
             // STEP 7: Swap buffers for next tile
@@ -954,10 +981,10 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
     
     // Wait for final DMA to complete before ending write session
     if (dma_pending) {
-        M5.Display.waitDMA();
+        BoardDisplay_WaitPush();
     }
-    
-    M5.Display.endWrite();
+
+    BoardDisplay_EndTiles();
 }
 
 /*
@@ -989,8 +1016,8 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
     bool dma_pending = false;
     int pending_display_y = 0;
     
-    M5.Display.startWrite();
-    
+    BoardDisplay_BeginTiles();
+
     // Process 4 Mac rows at a time (produces 8 display rows with 2x scaling)
     // Double-buffering: render to one buffer while DMA pushes the other
     for (int mac_y = 0; mac_y < MAC_SCREEN_HEIGHT; mac_y += 4) {
@@ -1062,7 +1089,7 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
         
         // Wait for any pending DMA transfer to complete before swapping buffers
         if (dma_pending) {
-            M5.Display.waitDMA();
+            BoardDisplay_WaitPush();
             dma_pending = false;
         }
         
@@ -1071,11 +1098,12 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
         render_buffer = push_buffer;
         push_buffer = temp;
         
-        // Start async DMA push of the just-rendered buffer (now in push_buffer)
-        // 8 display rows * 1280 pixels = 10240 pixels per chunk
+        // Start async push of the just-rendered buffer (now in push_buffer)
+        // 8 display rows * DISPLAY_WIDTH pixels per chunk
         int display_y = mac_y * PIXEL_SCALE;
-        M5.Display.setAddrWindow(0, display_y, DISPLAY_WIDTH, STREAMING_ROW_COUNT);
-        M5.Display.writePixelsDMA(push_buffer, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
+        BoardDisplay_PushTile(0, display_y,
+                              DISPLAY_WIDTH, STREAMING_ROW_COUNT,
+                              push_buffer);
         dma_pending = true;
         pending_display_y = display_y;
         
@@ -1088,10 +1116,10 @@ static void renderFrameStreaming(uint8 *src_buffer, uint16 *local_palette)
     
     // Wait for final DMA transfer to complete
     if (dma_pending) {
-        M5.Display.waitDMA();
+        BoardDisplay_WaitPush();
     }
-    
-    M5.Display.endWrite();
+
+    BoardDisplay_EndTiles();
 }
 
 /*
@@ -1268,9 +1296,9 @@ bool VideoInit(bool classic)
     
     UNUSED(classic);
     
-    // Get display dimensions
-    display_width = M5.Display.width();
-    display_height = M5.Display.height();
+    // Get display dimensions (post-HAL rotation if any)
+    display_width  = BoardDisplay_Width();
+    display_height = BoardDisplay_Height();
     Serial.printf("[VIDEO] Display size: %dx%d\n", display_width, display_height);
     
     // Verify display size matches our expectations
@@ -1314,12 +1342,12 @@ bool VideoInit(bool classic)
     for (int i = 0; i < DISPLAY_WIDTH * STREAMING_ROW_COUNT; i++) {
         streaming_row_buffer_a[i] = gray565;
     }
-    M5.Display.startWrite();
+    BoardDisplay_BeginTiles();
     for (int y = 0; y < DISPLAY_HEIGHT; y += STREAMING_ROW_COUNT) {
-        M5.Display.setAddrWindow(0, y, DISPLAY_WIDTH, STREAMING_ROW_COUNT);
-        M5.Display.writePixels(streaming_row_buffer_a, DISPLAY_WIDTH * STREAMING_ROW_COUNT);
+        BoardDisplay_PushTile(0, y, DISPLAY_WIDTH, STREAMING_ROW_COUNT, streaming_row_buffer_a);
+        BoardDisplay_WaitPush();
     }
-    M5.Display.endWrite();
+    BoardDisplay_EndTiles();
     Serial.println("[VIDEO] Initial screen cleared");
     
     // Set up Mac frame buffer pointers
