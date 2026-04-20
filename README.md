@@ -46,6 +46,40 @@ Both variants share the BasiliskII core, video pipeline, USB HID handling, and b
 
 ---
 
+## What's New in v3.4
+
+- **Shared folder (ExtFS)** — pick a folder on your SD card in the pre-boot
+  menu and it appears as a mounted volume inside Mac OS, named after the
+  folder (e.g. `/Shared` becomes a `Shared` disk on the desktop). Lets
+  you drop disk images, docs, or installers onto the SD card from your
+  host and have them show up live in the emulator without re-imaging the
+  hard disk. Finder info and resource forks are preserved via `.finf/`
+  and `.rsrc/` sidecar directories on the FAT/exFAT SD card.
+- **USB Disk mode** — a new button on the pre-boot settings screen
+  exposes the SD card over USB Mass Storage, so you can copy files to/
+  from the card without removing it from the device (Tab5).
+- **Baked-in ESP32-C6 WiFi firmware** (Waveshare) — the matching
+  co-processor firmware is now embedded in the host firmware and
+  auto-flashed over SDIO hosted OTA on first boot if the slave is out
+  of date. No internet, no manual recovery, no chicken-and-egg when
+  WiFi itself is broken. A "Updating WiFi" splash shows during the
+  ~30 s update, then the host reboots into working WiFi.
+- **Cleaner splash → Mac OS handoff** — the pre-boot splash stays on
+  the panel until the 68k actually starts writing to the framebuffer,
+  so there's no gray flash between the Happy Mac and the Welcome
+  banner.
+- **Fewer SD writes during emulation** — XPRAM (PRAM) now shadows the
+  last-written copy and only hits the SD card when it actually
+  changes, which both speeds up idle-loop startup and reduces wear.
+- **Fix: outdated C6 firmware no longer bricks SD access.** The old
+  WiFi teardown path used to deinit the shared `esp_driver_sdmmc` host
+  context; we now leave it up so the microSD and the C6 radio can
+  coexist safely.
+- **Fix: ExtFS + WiFi volumes now have readable names** in the Mac
+  Finder (the upstream `GetString()` stub was returning empty strings).
+
+---
+
 ## Overview
 
 This project runs a **Motorola 68040** emulator that can boot real Macintosh ROMs and run genuine classic Mac OS software. Performance is comparable to a **Macintosh Quadra 610** (25 MHz 68040), achieving **24 FPS video** and **2-3 MIPS** CPU speed. The emulation includes:
@@ -309,7 +343,7 @@ esptool.py --chip esp32p4 \
     --port /dev/ttyACM0 \
     --baud 921600 \
     write_flash \
-    0x0 M5Tab-Macintosh-v3.0.bin
+    0x0 M5Tab-Macintosh-v3.4.bin
 ```
 
 **Note**: Replace `/dev/ttyACM0` with your actual port:
@@ -347,17 +381,19 @@ When you build with `pio run`, a merged binary is automatically created in the `
 For versioned releases, use the release script:
 
 ```bash
-# Create a versioned release binary
-./scripts/build_release.sh v3.0
+# Create versioned release binaries for both boards
+./scripts/build_release.sh v3.4
 
-# Output: release/M5Tab-Macintosh-v3.0.bin
+# Output:
+#   release/M5Tab-Macintosh-v3.4.bin
+#   release/M5Tab-Macintosh-Waveshare-P4-10.1-v3.4.bin
 ```
 
 The release binary can be flashed with a single esptool command:
 
 ```bash
 esptool --chip esp32p4 --port /dev/cu.usbmodem* \
-    --baud 921600 write-flash 0x0 release/M5Tab-Macintosh-v3.0.bin
+    --baud 921600 write-flash 0x0 release/M5Tab-Macintosh-v3.4.bin
 ```
 
 ---

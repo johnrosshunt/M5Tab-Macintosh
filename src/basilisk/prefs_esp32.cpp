@@ -7,6 +7,7 @@
 #include "sysdeps.h"
 #include "prefs.h"
 #include "boot_gui.h"
+#include "board_config.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -75,7 +76,32 @@ void LoadPrefs(const char *vmdir)
         PrefsReplaceBool("nocdrom", true);
         Serial.println("[PREFS] CD-ROM: None");
     }
-    
+
+    // Get the shared-folder ("Unix root") path for ExtFS. BootGUI stores
+    // paths relative to the SD root (e.g. "/Shared"); extfs.cpp / POSIX
+    // need the full VFS path so we prepend BOARD_SD_MOUNT_POINT here.
+    // Tab5 mounts the card at "/" and Waveshare at "/sd", so this resolves
+    // to "/Shared" and "/sd/Shared" respectively.
+    const char* extfs_rel = BootGUI_GetExtFSPath();
+    if (extfs_rel && strlen(extfs_rel) > 0) {
+        char extfs_vfs_path[BOOT_GUI_MAX_PATH + 8];
+        const char* mount = BOARD_SD_MOUNT_POINT;
+        if (mount == NULL || mount[0] == '\0' ||
+            (mount[0] == '/' && mount[1] == '\0')) {
+            // Mount point is root ("/") - the SD-root-relative path already
+            // starts with '/', so use it verbatim without double-slashing.
+            snprintf(extfs_vfs_path, sizeof(extfs_vfs_path), "%s", extfs_rel);
+        } else {
+            snprintf(extfs_vfs_path, sizeof(extfs_vfs_path), "%s%s",
+                     mount, extfs_rel);
+        }
+        PrefsReplaceString("extfs", extfs_vfs_path);
+        Serial.printf("[PREFS] Shared folder (ExtFS): %s\n", extfs_vfs_path);
+    } else {
+        PrefsRemoveItem("extfs");
+        Serial.println("[PREFS] Shared folder (ExtFS): disabled");
+    }
+
     // No GUI
     PrefsReplaceBool("nogui", true);
     

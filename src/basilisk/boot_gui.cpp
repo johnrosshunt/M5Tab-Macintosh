@@ -22,6 +22,7 @@
 #include <WiFi.h>
 #include <vector>
 #include <string>
+#include <climits>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -33,6 +34,9 @@
 #include "board_touch.h"
 #include "board_wifi.h"
 #include "board_sd.h"  /* SD_FS alias */
+#include "chicago_font.h"
+#include "asset_bg_tile.h"   /* Classic 50% gray desktop stipple pattern */
+#include "usb_msc.h"
 
 // Balanced defaults: auto-connect and keep WiFi for emulator networking.
 #ifndef BOOTGUI_ENABLE_WIFI_AUTOCONNECT
@@ -78,6 +82,13 @@ static void touchTask(void* param)
     
     TouchEvent evt;
     bool local_prev_pressed = false;
+    // Last-known press coordinates. The Waveshare touch HAL zeros (x,y)
+    // the instant the finger lifts, so the raw release sample carries
+    // useless coordinates. Cache the most recent pressed position here
+    // and re-use it on release so the UI can hit-test where the finger
+    // actually lifted (keyboard keys, Done/Cancel buttons, list rows).
+    int16_t last_press_x = 0;
+    int16_t last_press_y = 0;
     
     while (touch_task_running) {
         // Refresh the board's cached touch state
@@ -96,9 +107,19 @@ static void touchTask(void* param)
         bool just_pressed = current_pressed && !local_prev_pressed;
         bool just_released = !current_pressed && local_prev_pressed;
 
-        // Fill event structure
-        evt.x = touch.x;
-        evt.y = touch.y;
+        // Fill event structure. While the finger is down, pass the live
+        // coordinates and remember them. Once it lifts, re-use the last
+        // cached position so the release-edge consumer sees the spot the
+        // user was actually pointing at, not (0,0).
+        if (current_pressed) {
+            last_press_x = (int16_t)touch.x;
+            last_press_y = (int16_t)touch.y;
+            evt.x = touch.x;
+            evt.y = touch.y;
+        } else {
+            evt.x = last_press_x;
+            evt.y = last_press_y;
+        }
         evt.is_pressed = current_pressed;
         
         // Use spinlock to safely set edge flags
@@ -210,8 +231,17 @@ static void stopTouchTask(void)
     Serial.println("[BOOT_GUI] Touch task cleanup complete");
 }
 
-// Get the latest touch event from the queue
-// Clears edge flags after reading to ensure edges are only reported once
+// Get the latest touch event from the queue.
+//
+// The queue is written with xQueueOverwrite every ~16ms and polled here
+// every ~1ms, so the same queued event is visible to many callers in a
+// row. If we trusted the queued `was_pressed` / `was_released` flags we
+// would re-fire the same rising/falling edge up to ~16 times per tap,
+// which would (among other things) type 16 copies of every keyboard
+// keystroke. Instead, ignore the queued edge bits entirely: take the
+// authoritative edge state directly from the spinlock-guarded globals
+// and clear them in the same atomic block so the edge is consumed
+// exactly once no matter how often this function is called.
 static bool getTouchEvent(TouchEvent* evt)
 {
     if (!touch_queue || !evt) {
@@ -223,14 +253,15 @@ static bool getTouchEvent(TouchEvent* evt)
         return false;
     }
     
-    // Clear edge flags after reading so they're only reported once
+    // Override the queued edge flags with (and then clear) the live
+    // globals. Using one critical section for both the read and the
+    // clear means we can't race the touch task and drop a newly-set
+    // edge.
     portENTER_CRITICAL(&touch_spinlock);
-    if (evt->was_pressed) {
-        touch_edge_pressed = false;
-    }
-    if (evt->was_released) {
-        touch_edge_released = false;
-    }
+    evt->was_pressed  = touch_edge_pressed;
+    evt->was_released = touch_edge_released;
+    touch_edge_pressed  = false;
+    touch_edge_released = false;
     portEXIT_CRITICAL(&touch_spinlock);
     
     return true;
@@ -245,6 +276,25 @@ static bool getTouchEvent(TouchEvent* evt)
 #define MAC_LIGHT_GRAY  0xC618  // #C0C0C0
 #define MAC_DARK_GRAY   0x8410  // #808080
 #define MAC_DESKTOP     0xA514  // Classic Mac desktop gray pattern base
+
+// ============================================================================
+// Typography scales (passed to Chicago_DrawString)
+// ============================================================================
+// Classic Mac OS used a single 12pt Chicago for menu bar, buttons, dialog
+// titles and body text. We honour that here by defining every scale as
+// `CHI_SCALE` so changing it in one place re-flows the whole UI.
+// pixChicago at scale=1 has a 23px line height, which reads well on the
+// 1280-wide display this boot GUI targets.
+#define CHI_SCALE        1
+#define CHI_SCALE_BODY   CHI_SCALE
+#define CHI_SCALE_BTN    CHI_SCALE
+#define CHI_SCALE_TITLE  CHI_SCALE
+#define CHI_SCALE_MENU   CHI_SCALE
+
+// Menu bar has to be tall enough to comfortably fit a 23px line height
+// with a little breathing room below the baseline.
+#define MENU_BAR_HEIGHT 28
+#define CLOSE_BOX_SIZE  11
 
 // ============================================================================
 // UI Layout Constants - Touch-friendly for 5" 1280x720 display
@@ -277,6 +327,7 @@ static int SCREEN_HEIGHT = 720;
 
 static char selected_disk_path[BOOT_GUI_MAX_PATH] = "";
 static char selected_cdrom_path[BOOT_GUI_MAX_PATH] = "";
+static char selected_extfs_path[BOOT_GUI_MAX_PATH] = "";
 static int selected_ram_mb = 8;  // Default 8MB
 static bool skip_gui = false;    // If true, skip boot GUI and go straight to emulator
 
@@ -297,11 +348,14 @@ static const char* SETTINGS_FILE = "/basilisk_settings.txt";
 
 static std::vector<std::string> disk_files;
 static std::vector<std::string> cdrom_files;
+static std::vector<std::string> extfs_folders;
 
 static int disk_selection_index = 0;
 static int cdrom_selection_index = 0;  // 0 = None
+static int extfs_selection_index = 0;  // 0 = None
 static int disk_scroll_offset = 0;
 static int cdrom_scroll_offset = 0;
+static int extfs_scroll_offset = 0;
 
 // ============================================================================
 // UI State
@@ -334,10 +388,14 @@ static void drawRadioButton(int x, int y, const char* label, bool selected);
 static bool isPointInRect(int px, int py, int rx, int ry, int rw, int rh);
 static void runSettingsScreen(void);
 static void runWiFiScreen(void);
+static void runUsbMscScreen(void);
 static void initWiFi(void);
+static void drawC6FirmwareUpdateSplash(void);
+static void runC6FirmwareUpdateIfNeeded(void);
 static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int highlight_key);
 static int getKeyboardKey(int touch_x, int touch_y, int kb_x, int kb_y, int kb_w, int kb_h);
 static void drawSignalBars(int x, int y, int rssi);
+static void drawWifiStatusStrip(int x, int y, int w, int h);
 
 // ============================================================================
 // Settings Load/Save
@@ -373,6 +431,9 @@ static void loadSettings(void)
         } else if (key == "cdrom") {
             strncpy(selected_cdrom_path, value.c_str(), BOOT_GUI_MAX_PATH - 1);
             Serial.printf("[BOOT_GUI] Loaded cdrom: %s\n", selected_cdrom_path);
+        } else if (key == "extfs") {
+            strncpy(selected_extfs_path, value.c_str(), BOOT_GUI_MAX_PATH - 1);
+            Serial.printf("[BOOT_GUI] Loaded shared folder: %s\n", selected_extfs_path);
         } else if (key == "ramsize") {
             selected_ram_mb = value.toInt();
             if (selected_ram_mb != 4 && selected_ram_mb != 8 && 
@@ -418,6 +479,7 @@ static void saveSettings(void)
     
     file.printf("disk=%s\n", selected_disk_path);
     file.printf("cdrom=%s\n", selected_cdrom_path);
+    file.printf("extfs=%s\n", selected_extfs_path);
     file.printf("ramsize=%d\n", selected_ram_mb);
     file.printf("skip_gui=%s\n", skip_gui ? "yes" : "no");
     
@@ -551,23 +613,239 @@ static void scanCDROMFiles(void)
     }
 }
 
+// Scan the SD root for top-level directories that can be shared with the
+// guest Mac via ExtFS. The picker in the settings UI always leads with a
+// synthetic "None" entry, so users can disable the shared volume without
+// having to clear a text field.
+static void scanExtFSFolders(void)
+{
+    Serial.println("[BOOT_GUI] Scanning for shared folders...");
+    extfs_folders.clear();
+
+    File root = SD_FS.open("/");
+    if (!root) {
+        Serial.println("[BOOT_GUI] ERROR: Cannot open SD root");
+        return;
+    }
+
+    while (true) {
+        File entry = root.openNextFile();
+        if (!entry) {
+            break;
+        }
+
+        if (entry.isDirectory()) {
+            // Arduino's File::name() returns just the basename for
+            // directories opened from the root. Normalize to strip any
+            // leading slash the underlying driver might include.
+            const char* raw = entry.name();
+            if (raw == NULL) {
+                entry.close();
+                continue;
+            }
+            const char* name = (raw[0] == '/') ? raw + 1 : raw;
+
+            // Hide dotfiles (including our own .finf/.rsrc sidecars that
+            // will appear once ExtFS starts writing Finder metadata) and
+            // the FAT bookkeeping folder Windows creates automatically.
+            bool skip = (name[0] == '.') ||
+                        (strcasecmp(name, "System Volume Information") == 0);
+            if (!skip) {
+                std::string path = "/";
+                path += name;
+                extfs_folders.push_back(path);
+                Serial.printf("[BOOT_GUI] Found shared folder: %s\n",
+                              path.c_str());
+            }
+        }
+        entry.close();
+
+        if (extfs_folders.size() >= BOOT_GUI_MAX_FILES) {
+            break;
+        }
+    }
+    root.close();
+
+    Serial.printf("[BOOT_GUI] Found %d shared folders\n",
+                  (int)extfs_folders.size());
+
+    // Find index of currently selected folder (0 = None).
+    extfs_selection_index = 0;
+    if (strlen(selected_extfs_path) > 0) {
+        for (size_t i = 0; i < extfs_folders.size(); i++) {
+            if (extfs_folders[i] == selected_extfs_path) {
+                extfs_selection_index = i + 1;  // +1 because 0 is "None"
+                break;
+            }
+        }
+        // If the saved folder no longer exists on the card, fall back to
+        // "None" rather than silently keeping a dangling path.
+        if (extfs_selection_index == 0) {
+            Serial.printf("[BOOT_GUI] Saved shared folder %s no longer present, defaulting to None\n",
+                          selected_extfs_path);
+            selected_extfs_path[0] = '\0';
+        }
+    }
+}
+
 // ============================================================================
 // Drawing Functions - Desktop Pattern
 // ============================================================================
 
 static void drawDesktopPattern(void)
 {
-    // Classic Mac desktop gray pattern
-    gfx.fillScreen(MAC_LIGHT_GRAY);
-    
-    // Draw subtle checkerboard pattern
-    for (int y = 0; y < SCREEN_HEIGHT; y += 2) {
-        for (int x = 0; x < SCREEN_WIDTH; x += 2) {
-            if ((x + y) % 4 == 0) {
-                gfx.drawPixel(x, y, MAC_DESKTOP);
+    // Tile the classic 50% gray stipple (same pattern MacSplash uses) at
+    // 2x so each source pixel becomes a 2x2 block. On the Waveshare
+    // 1280x800 panel this lines up with the Mac OS desktop pattern.
+    Gfx_TileBackground(BG_TILE_PIXELS, BG_TILE_W, BG_TILE_H, /*scale=*/2);
+}
+
+// Re-tile a rectangle with the desktop stipple so partial redraws can
+// erase prior content without leaving a flat-gray patch over the pattern.
+// Matches the same 2x block scale drawDesktopPattern() uses.
+static void fillWithDesktopStipple(int x, int y, int w, int h)
+{
+    if (w <= 0 || h <= 0) return;
+    const int block = 2;
+    int x_end = x + w;
+    int y_end = y + h;
+    for (int yy = y; yy < y_end; yy += block) {
+        int src_y = (yy / block) % BG_TILE_H;
+        for (int xx = x; xx < x_end; xx += block) {
+            int src_x   = (xx / block) % BG_TILE_W;
+            uint16_t c  = BG_TILE_PIXELS[src_y * BG_TILE_W + src_x];
+            int bw      = block;
+            int bh      = block;
+            if (xx + bw > x_end) bw = x_end - xx;
+            if (yy + bh > y_end) bh = y_end - yy;
+            gfx.fillRect(xx, yy, bw, bh, c);
+        }
+    }
+}
+
+// Draw a short label with a white "paper" backing and 1px black border so
+// it stays readable when sitting on top of the 50% gray desktop stipple.
+// The (x, y) anchor keeps the same semantics as Chicago_DrawString so this
+// can be used as a drop-in replacement for `Chicago_DrawString(...)` in
+// places where text was previously painted directly onto the pattern.
+#define LABEL_BADGE_PAD_X 6
+#define LABEL_BADGE_PAD_Y 2
+static void drawLabelBadge(const char *text, int x, int y, int datum, int scale)
+{
+    if (!text || !text[0]) return;
+
+    int text_w = Chicago_MeasureWidth(text, scale);
+    int text_h = Chicago_LineHeight(scale);
+    int box_w  = text_w + LABEL_BADGE_PAD_X * 2;
+    int box_h  = text_h + LABEL_BADGE_PAD_Y * 2;
+
+    // Compute the box top-left so it visually wraps the text at its
+    // existing anchor (matching drawString datum semantics).
+    int box_x = x - LABEL_BADGE_PAD_X;
+    int box_y = y - LABEL_BADGE_PAD_Y;
+
+    switch (datum) {
+        case TC_DATUM:
+        case MC_DATUM:
+        case BC_DATUM:
+            box_x = x - box_w / 2;
+            break;
+        case TR_DATUM:
+        case MR_DATUM:
+        case BR_DATUM:
+            box_x = x - text_w - LABEL_BADGE_PAD_X;
+            break;
+        default:
+            box_x = x - LABEL_BADGE_PAD_X;
+            break;
+    }
+
+    switch (datum) {
+        case ML_DATUM:
+        case MC_DATUM:
+        case MR_DATUM:
+            box_y = y - box_h / 2;
+            break;
+        case BL_DATUM:
+        case BC_DATUM:
+        case BR_DATUM:
+            box_y = y - text_h - LABEL_BADGE_PAD_Y;
+            break;
+        default:
+            box_y = y - LABEL_BADGE_PAD_Y;
+            break;
+    }
+
+    gfx.fillRect(box_x, box_y, box_w, box_h, MAC_WHITE);
+    gfx.drawRect(box_x, box_y, box_w, box_h, MAC_BLACK);
+
+    Chicago_DrawString(text, x, y, MAC_BLACK, datum, scale);
+}
+
+// ============================================================================
+// Classic Mac menu bar - drawn at the top of every pre-boot screen.
+// White background, 1px black separator, an Apple glyph on the left, the
+// screen title in Chicago, and a running clock on the right.
+// ============================================================================
+static void drawAppleGlyph(int x, int y)
+{
+    // Tiny 10x11 black silhouette that reads as the classic Apple mark at
+    // a glance. Not pixel-accurate to the real Mac ROM, but good enough
+    // for flavor at this size.
+    const uint16_t bits[11] = {
+        0b0000011000,
+        0b0000110000,
+        0b0000110000,
+        0b0001110000,
+        0b0111111110,
+        0b1111111111,
+        0b1111111111,
+        0b1111111111,
+        0b0111111110,
+        0b0011111100,
+        0b0010100100,
+    };
+    for (int row = 0; row < 11; ++row) {
+        uint16_t bb = bits[row];
+        for (int col = 0; col < 10; ++col) {
+            if (bb & (1u << (9 - col))) {
+                gfx.fillRect(x + col, y + row, 1, 1, MAC_BLACK);
             }
         }
     }
+}
+
+static void drawMenuBar(const char *title)
+{
+    (void)title;  // Screen name is shown as a content-area heading instead.
+
+    // Background fill.
+    gfx.fillRect(0, 0, SCREEN_WIDTH, MENU_BAR_HEIGHT, MAC_WHITE);
+    // 1px bottom separator.
+    gfx.drawFastHLine(0, MENU_BAR_HEIGHT - 1, SCREEN_WIDTH, MAC_BLACK);
+
+    // Apple glyph on the left.
+    drawAppleGlyph(10, (MENU_BAR_HEIGHT - 11) / 2);
+
+    // Static menu titles. Purely decorative - these don't open anything.
+    int base_x = 40;
+    int text_y = (MENU_BAR_HEIGHT - Chicago_LineHeight(CHI_SCALE_MENU)) / 2;
+    if (text_y < 0) text_y = 0;
+    const char *items[] = { "File", "Edit", "View", "Special" };
+    for (int i = 0; i < 4; ++i) {
+        Chicago_DrawString(items[i], base_x, text_y, MAC_BLACK, TL_DATUM,
+                           CHI_SCALE_MENU);
+        base_x += Chicago_MeasureWidth(items[i], CHI_SCALE_MENU) + 18;
+    }
+}
+
+// Decorative close-box drawn on windows. Matches the classic Mac design:
+// 11x11 square with a 3px white inset so it reads as "hollow" at a glance.
+static void drawCloseBox(int x, int y)
+{
+    gfx.drawRect(x, y, CLOSE_BOX_SIZE, CLOSE_BOX_SIZE, MAC_BLACK);
+    gfx.fillRect(x + 1, y + 1, CLOSE_BOX_SIZE - 2, CLOSE_BOX_SIZE - 2,
+                 MAC_WHITE);
 }
 
 // ============================================================================
@@ -593,16 +871,17 @@ static void drawWindow(int x, int y, int w, int h, const char* title)
     }
     
     // Title text background (white box in center of title bar)
-    int title_width = strlen(title) * 12 + 16;
+    int title_width = Chicago_MeasureWidth(title, CHI_SCALE_TITLE) + 20;
     int title_x = x + (w - title_width) / 2;
     gfx.fillRect(title_x, y + 2, title_width, TITLE_BAR_HEIGHT, MAC_WHITE);
-    
-    // Title text
-    gfx.setTextColor(MAC_BLACK);
-    gfx.setTextSize(2);
-    gfx.setTextDatum(MC_DATUM);
-    gfx.drawString(title, x + w / 2, y + TITLE_BAR_HEIGHT / 2 + 2);
-    
+
+    // Title text in Chicago.
+    Chicago_DrawString(title, x + w / 2, y + TITLE_BAR_HEIGHT / 2 + 2,
+                       MAC_BLACK, MC_DATUM, CHI_SCALE_TITLE);
+
+    // Decorative close box at top-left of title bar.
+    drawCloseBox(x + 8, y + (TITLE_BAR_HEIGHT - CLOSE_BOX_SIZE) / 2 + 2);
+
     // Divider line below title bar
     gfx.drawFastHLine(x + 2, y + TITLE_BAR_HEIGHT + 2, w - 4, MAC_BLACK);
 }
@@ -613,41 +892,36 @@ static void drawWindow(int x, int y, int w, int h, const char* title)
 
 static void drawButton(int x, int y, int w, int h, const char* label, bool pressed)
 {
+    uint16_t fg;
     if (pressed) {
-        // Pressed state - inverted
+        // Pressed state - inverted (classic Mac push-button selected state).
         gfx.fillRect(x, y, w, h, MAC_BLACK);
-        gfx.setTextColor(MAC_WHITE);
+        fg = MAC_WHITE;
     } else {
-        // Normal state - 3D beveled
+        // Normal state - white fill with a heavy black border on the
+        // bottom/right (the classic "default button" drop shadow), a
+        // 1px black outline, and a 1px white highlight on the
+        // top/left so the button reads as raised.
         gfx.fillRect(x, y, w, h, MAC_WHITE);
-        
-        // Top and left edges (light)
-        gfx.drawFastHLine(x, y, w, MAC_WHITE);
-        gfx.drawFastVLine(x, y, h, MAC_WHITE);
-        
-        // Bottom and right edges (dark)
-        gfx.drawFastHLine(x, y + h - 1, w, MAC_BLACK);
-        gfx.drawFastHLine(x + 1, y + h - 2, w - 2, MAC_DARK_GRAY);
-        gfx.drawFastVLine(x + w - 1, y, h, MAC_BLACK);
-        gfx.drawFastVLine(x + w - 2, y + 1, h - 2, MAC_DARK_GRAY);
-        
-        // Border
+
+        // 1-px raised highlight (top/left).
+        gfx.drawFastHLine(x + 1, y + 1, w - 2, MAC_WHITE);
+        gfx.drawFastVLine(x + 1, y + 1, h - 2, MAC_WHITE);
+
+        // Dropshadow (bottom/right).
+        gfx.drawFastHLine(x + 1, y + h - 1, w - 2, MAC_DARK_GRAY);
+        gfx.drawFastVLine(x + w - 1, y + 1, h - 2, MAC_DARK_GRAY);
+
+        // 1-px border around the whole thing.
         gfx.drawRect(x, y, w, h, MAC_BLACK);
-        
-        gfx.setTextColor(MAC_BLACK);
+
+        fg = MAC_BLACK;
     }
-    
-    // Button label - size based on button height
-    int text_size = 2;
-    if (h >= 60) {
-        text_size = 3;
-    }
-    if (h >= 80) {
-        text_size = 4;
-    }
-    gfx.setTextSize(text_size);
-    gfx.setTextDatum(MC_DATUM);
-    gfx.drawString(label, x + w / 2, y + h / 2);
+
+    // Chicago button label - same scale as every other label, per the
+    // classic "one 12pt Chicago everywhere" rule.
+    Chicago_DrawString(label, x + w / 2, y + h / 2, fg,
+                       MC_DATUM, CHI_SCALE_BTN);
 }
 
 // ============================================================================
@@ -672,10 +946,10 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
         total_items++;
     }
     
-    // Draw items - larger text for touch screen
-    gfx.setTextSize(2);
-    gfx.setTextDatum(ML_DATUM);
-    
+    // Reserve a 16px scrollbar rail on the right edge (classic Mac look).
+    const int SCROLLBAR_W = 16;
+    int content_w = w - SCROLLBAR_W;
+
     for (int i = 0; i < visible_count && (i + scroll_offset) < total_items; i++) {
         int item_index = i + scroll_offset;
         int item_y = y + 3 + i * LIST_ITEM_HEIGHT;
@@ -699,35 +973,75 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
                 continue;
             }
         }
-        
-        // Check if this item is selected
+
+        uint16_t fg = MAC_BLACK;
         if (item_index == selected) {
-            // Selected item - inverted with padding
-            gfx.fillRect(x + 3, item_y, w - 6, LIST_ITEM_HEIGHT, MAC_BLACK);
-            gfx.setTextColor(MAC_WHITE);
-        } else {
-            gfx.setTextColor(MAC_BLACK);
+            // Selected item - inverted with padding (classic List Manager
+            // highlight).
+            gfx.fillRect(x + 3, item_y, content_w - 6, LIST_ITEM_HEIGHT, MAC_BLACK);
+            fg = MAC_WHITE;
         }
-        
-        // Draw text (truncate if too long)
-        char truncated[32];
-        strncpy(truncated, item_text, 28);
-        truncated[28] = '\0';
-        if (strlen(item_text) > 28) {
+
+        // Truncate text to roughly fit the visible area.
+        char truncated[48];
+        strncpy(truncated, item_text, sizeof(truncated) - 1);
+        truncated[sizeof(truncated) - 1] = '\0';
+        // Rough char-budget: we have (content_w - 12) pixels at CHI_SCALE_BODY.
+        // pixChicago glyphs average ~9px at scale=1 => ~one char per 9px.
+        int char_budget = (content_w - 12) / 9;
+        if (char_budget > 0 && (int)strlen(truncated) > char_budget) {
+            truncated[char_budget - 3] = '\0';
             strcat(truncated, "...");
         }
-        
-        gfx.drawString(truncated, x + 6, item_y + LIST_ITEM_HEIGHT / 2);
+
+        Chicago_DrawString(truncated, x + 8, item_y + LIST_ITEM_HEIGHT / 2,
+                           fg, ML_DATUM, CHI_SCALE_BODY);
     }
-    
-    // Draw scroll indicators if needed
+
+    // ------------------------------------------------------------------
+    // Scrollbar rail on the right edge. Classic Mac look: white "elevator"
+    // rail bounded by black, arrow boxes top and bottom, and a shaded
+    // thumb indicating scroll position.
+    // ------------------------------------------------------------------
+    int sb_x = x + content_w;
+    int sb_y = y + 3;
+    int sb_h = h - 6;
+    // Rail
+    gfx.fillRect(sb_x, sb_y, SCROLLBAR_W, sb_h, MAC_WHITE);
+    gfx.drawRect(sb_x, sb_y, SCROLLBAR_W, sb_h, MAC_BLACK);
+    // Top arrow box
+    int arrow_h = 16;
+    gfx.drawFastHLine(sb_x, sb_y + arrow_h, SCROLLBAR_W, MAC_BLACK);
     if (scroll_offset > 0) {
-        // Up arrow indicator
-        gfx.fillTriangle(x + w - 12, y + 8, x + w - 8, y + 4, x + w - 4, y + 8, MAC_BLACK);
+        gfx.fillTriangle(sb_x + SCROLLBAR_W / 2, sb_y + 4,
+                         sb_x + 3, sb_y + arrow_h - 3,
+                         sb_x + SCROLLBAR_W - 3, sb_y + arrow_h - 3,
+                         MAC_BLACK);
     }
+    // Bottom arrow box
+    gfx.drawFastHLine(sb_x, sb_y + sb_h - arrow_h, SCROLLBAR_W, MAC_BLACK);
     if (scroll_offset + visible_count < total_items) {
-        // Down arrow indicator
-        gfx.fillTriangle(x + w - 12, h + y - 8, x + w - 8, h + y - 4, x + w - 4, h + y - 8, MAC_BLACK);
+        gfx.fillTriangle(sb_x + 3, sb_y + sb_h - arrow_h + 3,
+                         sb_x + SCROLLBAR_W - 3, sb_y + sb_h - arrow_h + 3,
+                         sb_x + SCROLLBAR_W / 2, sb_y + sb_h - 4,
+                         MAC_BLACK);
+    }
+    // Shaded thumb showing position.
+    if (total_items > visible_count) {
+        int track_h    = sb_h - arrow_h * 2;
+        int thumb_h    = (track_h * visible_count) / total_items;
+        if (thumb_h < 16) thumb_h = 16;
+        int thumb_max  = track_h - thumb_h;
+        int thumb_pos  = (scroll_offset * thumb_max) /
+                         (total_items - visible_count);
+        if (thumb_pos < 0) thumb_pos = 0;
+        int thumb_y    = sb_y + arrow_h + thumb_pos;
+        // 2px "grip" stippling for a classic look.
+        for (int iy = 0; iy < thumb_h; iy += 2) {
+            for (int ix = 2; ix < SCROLLBAR_W - 2; ix += 2) {
+                gfx.fillRect(sb_x + ix, thumb_y + iy, 1, 1, MAC_BLACK);
+            }
+        }
     }
 }
 
@@ -753,12 +1067,11 @@ static void drawRadioButton(int x, int y, const char* label, bool selected)
     if (selected) {
         gfx.fillCircle(cx, cy, r - 6, MAC_BLACK);
     }
-    
-    // Label - larger text
-    gfx.setTextColor(MAC_BLACK);
-    gfx.setTextSize(2);
-    gfx.setTextDatum(ML_DATUM);
-    gfx.drawString(label, x + RADIO_SIZE + 10, cy);
+
+    // Label in Chicago. Badged with a white backing so the text is
+    // legible against the 50% gray desktop stipple.
+    drawLabelBadge(label, x + RADIO_SIZE + 10, cy,
+                   ML_DATUM, CHI_SCALE_BODY);
 }
 
 // ============================================================================
@@ -789,12 +1102,10 @@ static void drawCheckbox(int x, int y, int size, const char* label, bool checked
             gfx.drawLine(x + size/2, y2 + i, x2, y1 + i, MAC_BLACK);
         }
     }
-    
-    // Label - larger text
-    gfx.setTextColor(MAC_BLACK);
-    gfx.setTextSize(2);
-    gfx.setTextDatum(ML_DATUM);
-    gfx.drawString(label, x + size + 10, y + size / 2);
+
+    // Label in Chicago. Badged for readability against the stipple.
+    drawLabelBadge(label, x + size + 10, y + size / 2,
+                   ML_DATUM, CHI_SCALE_BODY);
 }
 
 // ============================================================================
@@ -826,6 +1137,97 @@ static void initWiFi(void)
     
     wifi_initialized = true;
     Serial.println("[BOOT_GUI] WiFi initialized");
+}
+
+// ============================================================================
+// WiFi Co-processor Firmware Update
+//
+// On boards that talk WiFi via an SDIO-attached co-processor (ESP32-C6 on
+// the Waveshare P4 10.1), the slave firmware version is pinned by the
+// Arduino core we link against. A mismatch leaves WiFi stuck at
+// "Could not get slave firmware version" forever - even once the user
+// has selected a network. To keep the device recoverable without
+// needing Espressif's HTTPS CDN (chicken-and-egg since WiFi is broken)
+// we bake the matching `esp32c6-v<X.Y.Z>.bin` blob into flash via
+// scripts/fetch_c6_firmware.py and stream it into the slave over the
+// already-up hosted transport. On Tab5 both hooks are no-ops (the Tab5
+// stub in board_wifi_firmware_tab5.cpp always reports up-to-date).
+// ============================================================================
+
+static void drawC6FirmwareUpdateSplash(void)
+{
+    // Center a Mac-style alert panel explaining the long blocking op.
+    // Matches the USB Disk splash visual language so the device looks
+    // consistent while it's frozen for 10-30s streaming the blob.
+    drawDesktopPattern();
+    drawMenuBar("Basilisk II");
+
+    int panel_w = SCREEN_WIDTH * 3 / 5;
+    int panel_h = 260;
+    if (panel_w < 480) panel_w = 480;
+    int panel_x = (SCREEN_WIDTH  - panel_w) / 2;
+    int panel_y = (SCREEN_HEIGHT - panel_h) / 2;
+    drawWindow(panel_x, panel_y, panel_w, panel_h, "Updating WiFi");
+
+    int line_h = Chicago_LineHeight(CHI_SCALE_BODY) + 4;
+    int text_x = panel_x + panel_w / 2;
+    int text_y = panel_y + TITLE_BAR_HEIGHT + 40;
+
+    Chicago_DrawString("Updating the WiFi co-processor firmware.",
+                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+    text_y += line_h;
+    Chicago_DrawString("This only happens once after a firmware update.",
+                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+    text_y += line_h * 2;
+
+    Chicago_DrawString("Please wait - the device will restart",
+                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+    text_y += line_h;
+    Chicago_DrawString("automatically when the update is complete.",
+                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+    text_y += line_h * 2;
+
+    Chicago_DrawString("Do not unplug or power off.",
+                       text_x, text_y, MAC_DARK_GRAY, TC_DATUM, CHI_SCALE_BODY);
+
+    BoardDisplay_Present();
+}
+
+static void runC6FirmwareUpdateIfNeeded(void)
+{
+    // Tab5 stub short-circuits; on Waveshare this queries the hosted
+    // version RPC, so the transport must already be up (we ensured
+    // that via initWiFi() in BootGUI_Init before getting here).
+    if (!BoardWifi_IsCoprocessorFirmwareOutdated()) {
+        return;
+    }
+
+    Serial.println("[BOOT_GUI] WiFi co-processor firmware is outdated; applying embedded update...");
+    drawC6FirmwareUpdateSplash();
+
+    BoardWifiFirmwareResult r = BoardWifi_ApplyCoprocessorFirmware();
+    switch (r) {
+        case BOARD_WIFI_FW_UPDATED: {
+            // hostedActivateUpdate() has already triggered a C6 reset;
+            // the SDIO link is torn down, so the cleanest way to come
+            // up on matched firmware is a full host reboot. Give the
+            // user a beat to read the splash, then restart.
+            Serial.println("[BOOT_GUI] WiFi co-processor updated; rebooting host in 2s...");
+            delay(2000);
+            ESP.restart();
+            // not reached
+            break;
+        }
+        case BOARD_WIFI_FW_FAILED:
+            Serial.println("[BOOT_GUI] WiFi co-processor update FAILED; continuing without WiFi");
+            // Fall through - boot continues, WiFi will be unusable this
+            // session but everything else (SD, emulator) still works.
+            break;
+        case BOARD_WIFI_FW_UP_TO_DATE:
+        case BOARD_WIFI_FW_NOT_SUPPORTED:
+        default:
+            break;
+    }
 }
 
 // ============================================================================
@@ -864,6 +1266,78 @@ static void drawSignalBars(int x, int y, int rssi)
             // Empty bar (outline only)
             gfx.drawRect(bar_x, bar_y, bar_width, bar_height, MAC_DARK_GRAY);
         }
+    }
+}
+
+// ============================================================================
+// WiFi status strip - shown next to the WiFi button on the settings screen
+// so the user can see the live connection state without entering the WiFi
+// configuration screen.
+// ============================================================================
+static void drawWifiStatusStrip(int x, int y, int w, int h)
+{
+    // Paint a white "note card" behind the status strip so the text stays
+    // readable against the 50% gray desktop stipple. 1px black border
+    // matches the classic Mac dialog accent.
+    gfx.fillRect(x, y, w, h, MAC_WHITE);
+    gfx.drawRect(x, y, w, h, MAC_BLACK);
+
+    wl_status_t status = WiFi.status();
+    bool connected = (status == WL_CONNECTED);
+
+    // Inset everything by a few pixels so text isn't flush against the
+    // border, which would otherwise clip against the line.
+    int inner_x = x + 6;
+    int inner_y = y + 4;
+
+    // Top row: signal bars + status text.
+    int bars_x = inner_x;
+    int bars_y = inner_y + 2;
+    int text_x = inner_x + 36;  // Reserve ~36px for the 4-bar indicator.
+
+    if (connected) {
+        int rssi = WiFi.RSSI();
+        drawSignalBars(bars_x, bars_y, rssi);
+    } else {
+        // Empty outline bars to indicate "no signal".
+        drawSignalBars(bars_x, bars_y, -200);
+    }
+
+    const char *status_label = "Not connected";
+    if (connected) {
+        status_label = "Connected";
+    } else if (status == WL_DISCONNECTED && strlen(wifi_ssid) > 0 && wifi_auto_connect) {
+        status_label = "Connecting...";
+    } else if (status == WL_IDLE_STATUS && strlen(wifi_ssid) > 0 && wifi_auto_connect) {
+        status_label = "Connecting...";
+    } else if (status == WL_CONNECT_FAILED) {
+        status_label = "Connect failed";
+    } else if (status == WL_NO_SSID_AVAIL) {
+        status_label = "No network";
+    }
+    Chicago_DrawString(status_label, text_x, inner_y + 4, MAC_BLACK,
+                       TL_DATUM, CHI_SCALE_BODY);
+
+    // Second row: SSID (if we have one).
+    if (strlen(wifi_ssid) > 0) {
+        char ssid_display[20];
+        strncpy(ssid_display, wifi_ssid, sizeof(ssid_display) - 1);
+        ssid_display[sizeof(ssid_display) - 1] = '\0';
+        Chicago_DrawString(ssid_display, inner_x, inner_y + 28, MAC_BLACK,
+                           TL_DATUM, CHI_SCALE_BODY);
+    } else {
+        Chicago_DrawString("(no network saved)", inner_x, inner_y + 28, MAC_DARK_GRAY,
+                           TL_DATUM, CHI_SCALE_BODY);
+    }
+
+    // Third row: IP address (if connected).
+    if (connected) {
+        char ip_display[24];
+        IPAddress ip = WiFi.localIP();
+        snprintf(ip_display, sizeof(ip_display), "%u.%u.%u.%u",
+                 ip[0], ip[1], ip[2], ip[3]);
+        Chicago_DrawString(ip_display, inner_x, inner_y + 52, MAC_BLACK,
+                           TL_DATUM, CHI_SCALE_BODY);
     }
 }
 
@@ -928,23 +1402,22 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
         for (int col = 0; col < row_len; col++) {
             int key_x = start_x + col * (key_width + KB_KEY_MARGIN);
             bool is_highlighted = (key_index == highlight_key);
-            
-            // Draw key background
+
+            uint16_t fg;
             if (is_highlighted) {
                 gfx.fillRect(key_x, current_y, key_width, row_height, MAC_BLACK);
-                gfx.setTextColor(MAC_WHITE);
+                fg = MAC_WHITE;
             } else {
                 gfx.fillRect(key_x, current_y, key_width, row_height, MAC_WHITE);
                 gfx.drawRect(key_x, current_y, key_width, row_height, MAC_BLACK);
-                gfx.setTextColor(MAC_BLACK);
+                fg = MAC_BLACK;
             }
-            
-            // Draw key label
+
             char label[2] = {row_chars[col], '\0'};
-            gfx.setTextSize(2);
-            gfx.setTextDatum(MC_DATUM);
-            gfx.drawString(label, key_x + key_width / 2, current_y + row_height / 2);
-            
+            Chicago_DrawString(label, key_x + key_width / 2,
+                               current_y + row_height / 2,
+                               fg, MC_DATUM, CHI_SCALE_BTN);
+
             key_index++;
         }
         current_y += row_height + KB_KEY_MARGIN;
@@ -960,20 +1433,20 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
     
     // Shift key
     bool shift_highlighted = (highlight_key == 100);  // Special index for shift
+    uint16_t fg;
     if (shift_highlighted || shift_active) {
         gfx.fillRect(current_x, bottom_y, special_key_w, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_WHITE);
+        fg = MAC_WHITE;
     } else {
         gfx.fillRect(current_x, bottom_y, special_key_w, row_height, MAC_WHITE);
         gfx.drawRect(current_x, bottom_y, special_key_w, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_BLACK);
+        fg = MAC_BLACK;
     }
-    gfx.setTextSize(2);
-    gfx.setTextDatum(MC_DATUM);
-    gfx.drawString("Shift", current_x + special_key_w / 2, bottom_y + row_height / 2);
+    Chicago_DrawString("Shift", current_x + special_key_w / 2,
+                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
     current_x += special_key_w + KB_KEY_MARGIN;
-    
-    // Space key
+
+    // Space key (no label).
     bool space_highlighted = (highlight_key == 101);
     if (space_highlighted) {
         gfx.fillRect(current_x, bottom_y, space_key_w, row_height, MAC_BLACK);
@@ -982,44 +1455,47 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
         gfx.drawRect(current_x, bottom_y, space_key_w, row_height, MAC_BLACK);
     }
     current_x += space_key_w + KB_KEY_MARGIN;
-    
+
     // Backspace key
     bool bksp_highlighted = (highlight_key == 102);
     if (bksp_highlighted) {
         gfx.fillRect(current_x, bottom_y, special_key_w, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_WHITE);
+        fg = MAC_WHITE;
     } else {
         gfx.fillRect(current_x, bottom_y, special_key_w, row_height, MAC_WHITE);
         gfx.drawRect(current_x, bottom_y, special_key_w, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_BLACK);
+        fg = MAC_BLACK;
     }
-    gfx.drawString("<--", current_x + special_key_w / 2, bottom_y + row_height / 2);
+    Chicago_DrawString("<--", current_x + special_key_w / 2,
+                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
     current_x += special_key_w + KB_KEY_MARGIN;
-    
+
     // Enter key
     bool enter_highlighted = (highlight_key == 103);
     if (enter_highlighted) {
         gfx.fillRect(current_x, bottom_y, key_width, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_WHITE);
+        fg = MAC_WHITE;
     } else {
         gfx.fillRect(current_x, bottom_y, key_width, row_height, MAC_LIGHT_GRAY);
         gfx.drawRect(current_x, bottom_y, key_width, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_BLACK);
+        fg = MAC_BLACK;
     }
-    gfx.drawString("OK", current_x + key_width / 2, bottom_y + row_height / 2);
+    Chicago_DrawString("Done", current_x + key_width / 2,
+                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
     current_x += key_width + KB_KEY_MARGIN;
-    
+
     // Cancel key
     bool cancel_highlighted = (highlight_key == 104);
     if (cancel_highlighted) {
         gfx.fillRect(current_x, bottom_y, key_width, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_WHITE);
+        fg = MAC_WHITE;
     } else {
         gfx.fillRect(current_x, bottom_y, key_width, row_height, MAC_WHITE);
         gfx.drawRect(current_x, bottom_y, key_width, row_height, MAC_BLACK);
-        gfx.setTextColor(MAC_BLACK);
+        fg = MAC_BLACK;
     }
-    gfx.drawString("X", current_x + key_width / 2, bottom_y + row_height / 2);
+    Chicago_DrawString("Hide", current_x + key_width / 2,
+                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
 }
 
 // Get key code from touch position
@@ -1195,57 +1671,81 @@ static bool isPointInRect(int px, int py, int rx, int ry, int rw, int rh)
 static void runSettingsScreen(void)
 {
     Serial.println("[BOOT_GUI] Showing settings screen...");
-    Serial.printf("[BOOT_GUI] Found %d disk files, %d CD-ROM files\n", 
-                  (int)disk_files.size(), (int)cdrom_files.size());
+    Serial.printf("[BOOT_GUI] Found %d disk files, %d CD-ROM files, %d shared folders\n",
+                  (int)disk_files.size(), (int)cdrom_files.size(),
+                  (int)extfs_folders.size());
     
-    // Full-screen layout - no window, just content areas
+    // ----------------------------------------------------------------
+    // Layout
+    // ----------------------------------------------------------------
+    // Right sidebar hosts the WiFi button, WiFi status strip, and USB
+    // Disk button so they stack above the (bottom-center) Boot button
+    // without ever overlapping it. The lists and RAM/audio controls get
+    // the rest of the width.
     int content_x = SCREEN_MARGIN;
-    int content_y = SCREEN_MARGIN + TITLE_BAR_HEIGHT;
-    int content_w = SCREEN_WIDTH - SCREEN_MARGIN * 2;
-    
-    // List box dimensions - side by side, using most of screen width
+    int content_y = MENU_BAR_HEIGHT + 40;  // Room for title badge.
+
+    int sidebar_w = 200;
+    int sidebar_x = SCREEN_WIDTH - SCREEN_MARGIN - sidebar_w;
+    int sidebar_btn_h = 50;
+
+    // Main content column (everything that is NOT in the sidebar).
+    int main_w = sidebar_x - SCREEN_MARGIN - 20;  // 20px gutter.
+
+    // Sidebar: WiFi button / status card / USB Disk button, stacked.
+    int wifi_btn_x = sidebar_x;
+    int wifi_btn_y = content_y;
+    int wifi_btn_w = sidebar_w;
+    int wifi_btn_h = sidebar_btn_h;
+
+    int wifi_status_x = sidebar_x;
+    int wifi_status_y = wifi_btn_y + wifi_btn_h + 10;
+    int wifi_status_w = sidebar_w;
+    int wifi_status_h = 90;
+
+    int usb_btn_w = sidebar_w;
+    int usb_btn_h = sidebar_btn_h;
+    int usb_btn_x = sidebar_x;
+    int usb_btn_y = wifi_status_y + wifi_status_h + 10;
+    bool usb_available = UsbMsc_IsSupported();
+
+    // Lists: three columns (Hard Disk, CD-ROM, Shared Folder) inside the
+    // main column. At main_w=1020 / list_gap=30 this gives ~320px per list,
+    // which comfortably fits typical Mac filenames at LIST_ITEM_HEIGHT=55
+    // without bleeding into the right-hand WiFi/status/USB sidebar.
     int list_gap = 30;
-    int list_w = (content_w - list_gap) / 2;
+    int list_w = (main_w - list_gap * 2) / 3;
     int list_h = LIST_ITEM_HEIGHT * LIST_MAX_VISIBLE + 4;
-    int disk_list_x = content_x;
-    int cdrom_list_x = content_x + list_w + list_gap;
-    int list_y = content_y + 50;  // Space for labels
-    
-    // RAM radio buttons - below lists
+    int disk_list_x  = content_x;
+    int cdrom_list_x = content_x + (list_w + list_gap) * 1;
+    int extfs_list_x = content_x + (list_w + list_gap) * 2;
+    int list_y = content_y + 30;  // Room for the "Hard Disk:" label above.
+
+    // RAM radio buttons - below the lists, along the full main column.
     int ram_y = list_y + list_h + 30;
     int ram_x = content_x;
-    
-    // WiFi button - next to RAM radios
-    int wifi_btn_w = 150;
-    int wifi_btn_h = 60;
-    int wifi_btn_x = SCREEN_WIDTH - SCREEN_MARGIN - wifi_btn_w;
-    int wifi_btn_y = ram_y;
-    
-    // Audio checkbox - second row below RAM radios
-    int audio_y = ram_y + RADIO_SIZE + 30;
-    int audio_x = content_x;
-    int audio_checkbox_x = audio_x + 80;  // After "Audio:" label
-    int audio_checkbox_size = RADIO_SIZE;
-    
-    // Boot button - BIG and at bottom of screen
-    int boot_btn_w = 400;
-    int boot_btn_h = 80;
-    int boot_btn_x = (SCREEN_WIDTH - boot_btn_w) / 2;
-    int boot_btn_y = SCREEN_HEIGHT - boot_btn_h - SCREEN_MARGIN;
-    
-    // RAM radio region (for partial updates)
-    int radio_start_x = ram_x + 120;
-    int radio_gap = (SCREEN_WIDTH - radio_start_x - SCREEN_MARGIN - wifi_btn_w - 20) / 4;
+    int radio_start_x = ram_x + 110;
+    int radio_gap = (main_w - 110 - 20) / 4;
     int radio_region_x = radio_start_x - 5;
     int radio_region_y = ram_y - 5;
     int radio_region_w = radio_gap * 4 + 20;
     int radio_region_h = RADIO_SIZE + 30;
-    
-    // Audio checkbox region (for partial updates)
+
+    // Audio checkbox - second row below RAM radios.
+    int audio_y = ram_y + RADIO_SIZE + 30;
+    int audio_x = content_x;
+    int audio_checkbox_x = audio_x + 110;
+    int audio_checkbox_size = RADIO_SIZE;
     int audio_region_x = audio_x - 5;
     int audio_region_y = audio_y - 5;
-    int audio_region_w = 300;
+    int audio_region_w = 320;
     int audio_region_h = audio_checkbox_size + 20;
+
+    // Boot button - full-width primary action, docked bottom-center.
+    int boot_btn_w = 320;
+    int boot_btn_h = 60;
+    int boot_btn_x = (SCREEN_WIDTH - boot_btn_w) / 2;
+    int boot_btn_y = SCREEN_HEIGHT - boot_btn_h - SCREEN_MARGIN;
     
     // Debug: Print layout info
     Serial.printf("[BOOT_GUI] Layout: list_y=%d, list_h=%d, item_height=%d\n", list_y, list_h, LIST_ITEM_HEIGHT);
@@ -1256,34 +1756,51 @@ static void runSettingsScreen(void)
     bool wifi_pressed = false;
     bool prev_wifi_pressed = false;
     bool wifi_touch_started = false;
+    bool usb_pressed = false;
+    bool prev_usb_pressed = false;
+    bool usb_touch_started = false;
     bool should_boot = false;
     bool open_wifi = false;
+    bool open_usb = false;
     bool first_frame = true;
     
     // Track previous state for change detection
     int prev_disk_selection = disk_selection_index;
     int prev_cdrom_selection = cdrom_selection_index;
+    int prev_extfs_selection = extfs_selection_index;
     int prev_ram_mb = selected_ram_mb;
     bool prev_audio_enabled = audio_enabled;
+
+    // WiFi status polling state. We redraw the strip once per second, or
+    // immediately when the underlying connection state changes, so an
+    // async auto-connect completing during pre-boot becomes visible
+    // without the user leaving the settings screen.
+    uint32_t last_wifi_poll_ms = 0;
+    wl_status_t prev_wifi_status = (wl_status_t)-1;
+    int prev_wifi_rssi = 0;
     
     // Touch state - save position on press for use on release
     int touch_start_x = 0;
     int touch_start_y = 0;
     bool touch_in_disk_list = false;
     bool touch_in_cdrom_list = false;
+    bool touch_in_extfs_list = false;
     bool touch_in_boot_btn = false;
     bool touch_in_wifi_btn = false;
+    bool touch_in_usb_btn = false;
     bool touch_in_audio_checkbox = false;
     
     TouchEvent touch;
     
-    while (!should_boot && !open_wifi) {
+    while (!should_boot && !open_wifi && !open_usb) {
         bool disk_changed = false;
         bool cdrom_changed = false;
+        bool extfs_changed = false;
         bool ram_changed = false;
         bool audio_changed = false;
         bool boot_btn_changed = false;
         bool wifi_btn_changed = false;
+        bool usb_btn_changed  = false;
         
         // Get touch input from queue (non-blocking)
         if (getTouchEvent(&touch)) {
@@ -1293,8 +1810,11 @@ static void runSettingsScreen(void)
                 touch_start_y = touch.y;
                 touch_in_disk_list = isPointInRect(touch_start_x, touch_start_y, disk_list_x, list_y, list_w, list_h);
                 touch_in_cdrom_list = isPointInRect(touch_start_x, touch_start_y, cdrom_list_x, list_y, list_w, list_h);
+                touch_in_extfs_list = isPointInRect(touch_start_x, touch_start_y, extfs_list_x, list_y, list_w, list_h);
                 touch_in_boot_btn = isPointInRect(touch_start_x, touch_start_y, boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h);
                 touch_in_wifi_btn = isPointInRect(touch_start_x, touch_start_y, wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h);
+                touch_in_usb_btn = usb_available &&
+                    isPointInRect(touch_start_x, touch_start_y, usb_btn_x, usb_btn_y, usb_btn_w, usb_btn_h);
                 touch_in_audio_checkbox = isPointInRect(touch_start_x, touch_start_y, audio_x, audio_y, audio_region_w, audio_checkbox_size + 10);
                 
                 if (touch_in_boot_btn) {
@@ -1305,9 +1825,17 @@ static void runSettingsScreen(void)
                     wifi_touch_started = true;
                     wifi_pressed = true;
                 }
+                if (touch_in_usb_btn) {
+                    usb_touch_started = true;
+                    usb_pressed = true;
+                }
                 
-                Serial.printf("[BOOT_GUI] Touch start at (%d, %d) disk=%d cdrom=%d boot=%d wifi=%d audio=%d\n", 
-                              touch_start_x, touch_start_y, touch_in_disk_list, touch_in_cdrom_list, touch_in_boot_btn, touch_in_wifi_btn, touch_in_audio_checkbox);
+                Serial.printf("[BOOT_GUI] Touch start at (%d, %d) disk=%d cdrom=%d extfs=%d boot=%d wifi=%d audio=%d\n",
+                              touch_start_x, touch_start_y,
+                              touch_in_disk_list, touch_in_cdrom_list,
+                              touch_in_extfs_list,
+                              touch_in_boot_btn, touch_in_wifi_btn,
+                              touch_in_audio_checkbox);
             }
             
             // Detect touch release - use saved position for hit testing
@@ -1324,6 +1852,12 @@ static void runSettingsScreen(void)
                 if (wifi_touch_started) {
                     open_wifi = true;
                     Serial.println("[BOOT_GUI] WiFi button pressed");
+                }
+
+                // Check USB Disk button
+                if (usb_touch_started) {
+                    open_usb = true;
+                    Serial.println("[BOOT_GUI] USB Disk button pressed");
                 }
                 
                 // Check disk list click (use saved start position)
@@ -1349,7 +1883,28 @@ static void runSettingsScreen(void)
                         }
                     }
                 }
-                
+
+                // Check shared-folder list click (use saved start position).
+                // Index 0 is always "None"; indices 1..N map into extfs_folders.
+                if (touch_in_extfs_list) {
+                    int clicked_item = (touch_start_y - list_y - 2) / LIST_ITEM_HEIGHT + extfs_scroll_offset;
+                    int total_items = extfs_folders.size() + 1;  // +1 for "None"
+                    if (clicked_item >= 0 && clicked_item < total_items) {
+                        extfs_selection_index = clicked_item;
+                        if (clicked_item == 0) {
+                            selected_extfs_path[0] = '\0';
+                            Serial.println("[BOOT_GUI] Selected shared folder: None");
+                        } else {
+                            strncpy(selected_extfs_path,
+                                    extfs_folders[clicked_item - 1].c_str(),
+                                    BOOT_GUI_MAX_PATH - 1);
+                            selected_extfs_path[BOOT_GUI_MAX_PATH - 1] = '\0';
+                            Serial.printf("[BOOT_GUI] Selected shared folder [%d]: %s\n",
+                                          clicked_item, selected_extfs_path);
+                        }
+                    }
+                }
+
                 // Check RAM radio buttons
                 int radio_y_hit = ram_y;
                 int radio_hit_w = radio_gap - 10;
@@ -1374,15 +1929,19 @@ static void runSettingsScreen(void)
                 // Reset touch state
                 touch_in_disk_list = false;
                 touch_in_cdrom_list = false;
+                touch_in_extfs_list = false;
                 touch_in_boot_btn = false;
                 touch_in_wifi_btn = false;
+                touch_in_usb_btn = false;
                 touch_in_audio_checkbox = false;
                 boot_touch_started = false;
                 boot_pressed = false;
                 wifi_touch_started = false;
                 wifi_pressed = false;
+                usb_touch_started = false;
+                usb_pressed = false;
             }
-            
+
             // Update button visuals while held
             if (touch.is_pressed) {
                 if (boot_touch_started) {
@@ -1391,39 +1950,55 @@ static void runSettingsScreen(void)
                 if (wifi_touch_started) {
                     wifi_pressed = isPointInRect(touch.x, touch.y, wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h);
                 }
+                if (usb_touch_started) {
+                    usb_pressed = isPointInRect(touch.x, touch.y, usb_btn_x, usb_btn_y, usb_btn_w, usb_btn_h);
+                }
             }
         }
         
         // Check what changed
         disk_changed = (disk_selection_index != prev_disk_selection);
         cdrom_changed = (cdrom_selection_index != prev_cdrom_selection);
+        extfs_changed = (extfs_selection_index != prev_extfs_selection);
         ram_changed = (selected_ram_mb != prev_ram_mb);
         audio_changed = (audio_enabled != prev_audio_enabled);
         boot_btn_changed = (boot_pressed != prev_boot_pressed);
         wifi_btn_changed = (wifi_pressed != prev_wifi_pressed);
+        usb_btn_changed  = (usb_pressed != prev_usb_pressed);
         
         if (first_frame) {
-            // First frame - draw everything
-            gfx.fillScreen(MAC_LIGHT_GRAY);
-            
-            // Draw title
-            gfx.setTextColor(MAC_BLACK);
-            gfx.setTextSize(3);
-            gfx.setTextDatum(TC_DATUM);
-            gfx.drawString("Boot Settings", SCREEN_WIDTH / 2, SCREEN_MARGIN);
-            
-            // Draw labels
-            gfx.setTextSize(2);
-            gfx.setTextDatum(TL_DATUM);
-            gfx.drawString("Hard Disk:", disk_list_x, content_y);
-            gfx.drawString("CD-ROM:", cdrom_list_x, content_y);
-            gfx.drawString("Memory:", ram_x, ram_y + 10);
-            
-            // Draw lists
-            drawListBox(disk_list_x, list_y, list_w, list_h, disk_files, 
+            // First frame - draw everything. Use the tiled 50% gray stipple
+            // as the desktop background so this screen matches the Mac
+            // splash theme.
+            drawDesktopPattern();
+            drawMenuBar("Boot Settings");
+
+            // Section title under the menu bar. Wrapped in a white label
+            // badge so it reads cleanly on top of the desktop stipple.
+            drawLabelBadge("Boot Settings", SCREEN_WIDTH / 2,
+                           MENU_BAR_HEIGHT + 8,
+                           TC_DATUM, CHI_SCALE_TITLE);
+
+            // Field labels - also badged so they don't bleed into the
+            // 50% gray pattern beneath them.
+            drawLabelBadge("Hard Disk:",     disk_list_x,  content_y,
+                           TL_DATUM, CHI_SCALE_BODY);
+            drawLabelBadge("CD-ROM:",        cdrom_list_x, content_y,
+                           TL_DATUM, CHI_SCALE_BODY);
+            drawLabelBadge("Shared Folder:", extfs_list_x, content_y,
+                           TL_DATUM, CHI_SCALE_BODY);
+            drawLabelBadge("Memory:",        ram_x, ram_y + 10,
+                           TL_DATUM, CHI_SCALE_BODY);
+
+            // Draw lists. Hard Disk has no "None" (the emulator needs a
+            // boot volume), CD-ROM and Shared Folder both lead with "None"
+            // so they can be disabled.
+            drawListBox(disk_list_x,  list_y, list_w, list_h, disk_files,
                         disk_selection_index, disk_scroll_offset, false);
             drawListBox(cdrom_list_x, list_y, list_w, list_h, cdrom_files,
                         cdrom_selection_index, cdrom_scroll_offset, true);
+            drawListBox(extfs_list_x, list_y, list_w, list_h, extfs_folders,
+                        extfs_selection_index, extfs_scroll_offset, true);
             
             // Draw RAM radio buttons
             drawRadioButton(radio_start_x, ram_y, "4 MB", selected_ram_mb == 4);
@@ -1437,6 +2012,17 @@ static void runSettingsScreen(void)
             // Draw buttons
             drawButton(wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h, "WiFi", wifi_pressed);
             drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot", boot_pressed);
+            if (usb_available) {
+                drawButton(usb_btn_x, usb_btn_y, usb_btn_w, usb_btn_h,
+                           "USB Disk", usb_pressed);
+            }
+
+            // Initial WiFi status draw (subsequent updates handled below).
+            drawWifiStatusStrip(wifi_status_x, wifi_status_y, wifi_status_w, wifi_status_h);
+            last_wifi_poll_ms = millis();
+            prev_wifi_status  = WiFi.status();
+            prev_wifi_rssi    = (prev_wifi_status == WL_CONNECTED) ? WiFi.RSSI() : 0;
+
             first_frame = false;
         } else {
             // Incremental updates - drawing directly to display
@@ -1449,19 +2035,26 @@ static void runSettingsScreen(void)
                 drawListBox(cdrom_list_x, list_y, list_w, list_h, cdrom_files,
                             cdrom_selection_index, cdrom_scroll_offset, true);
             }
-            
+
+            if (extfs_changed) {
+                drawListBox(extfs_list_x, list_y, list_w, list_h, extfs_folders,
+                            extfs_selection_index, extfs_scroll_offset, true);
+            }
+
             if (ram_changed) {
-                // Clear and redraw radio region
-                gfx.fillRect(radio_region_x, radio_region_y, radio_region_w, radio_region_h, MAC_LIGHT_GRAY);
+                // Clear and redraw radio region (restore stipple background).
+                fillWithDesktopStipple(radio_region_x, radio_region_y,
+                                       radio_region_w, radio_region_h);
                 drawRadioButton(radio_start_x, ram_y, "4 MB", selected_ram_mb == 4);
                 drawRadioButton(radio_start_x + radio_gap, ram_y, "8 MB", selected_ram_mb == 8);
                 drawRadioButton(radio_start_x + radio_gap * 2, ram_y, "12 MB", selected_ram_mb == 12);
                 drawRadioButton(radio_start_x + radio_gap * 3, ram_y, "16 MB", selected_ram_mb == 16);
             }
-            
+
             if (audio_changed) {
-                // Clear and redraw audio checkbox region
-                gfx.fillRect(audio_region_x, audio_region_y, audio_region_w, audio_region_h, MAC_LIGHT_GRAY);
+                // Clear and redraw audio checkbox region.
+                fillWithDesktopStipple(audio_region_x, audio_region_y,
+                                       audio_region_w, audio_region_h);
                 drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
             }
             
@@ -1472,16 +2065,53 @@ static void runSettingsScreen(void)
             if (wifi_btn_changed) {
                 drawButton(wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h, "WiFi", wifi_pressed);
             }
+
+            if (usb_btn_changed && usb_available) {
+                drawButton(usb_btn_x, usb_btn_y, usb_btn_w, usb_btn_h,
+                           "USB Disk", usb_pressed);
+            }
         }
-        
+
         // Update state tracking
         prev_disk_selection = disk_selection_index;
         prev_cdrom_selection = cdrom_selection_index;
+        prev_extfs_selection = extfs_selection_index;
         prev_ram_mb = selected_ram_mb;
         prev_audio_enabled = audio_enabled;
         prev_boot_pressed = boot_pressed;
         prev_wifi_pressed = wifi_pressed;
-        
+        prev_usb_pressed  = usb_pressed;
+
+        // Poll WiFi status at ~1 Hz and redraw the status strip if anything
+        // changed. Handles the async auto-connect landing while we're
+        // sitting on this screen.
+        if (!first_frame) {
+            uint32_t now_ms = millis();
+            if (now_ms - last_wifi_poll_ms >= 1000) {
+                last_wifi_poll_ms = now_ms;
+                wl_status_t cur_status = WiFi.status();
+                int cur_rssi = (cur_status == WL_CONNECTED) ? WiFi.RSSI() : 0;
+                // RSSI can wiggle by a few dB even when nothing has really
+                // changed; only redraw if the bar count would change or the
+                // status itself flipped.
+                auto rssi_bars = [](int rssi) -> int {
+                    if (rssi >= -50) return 4;
+                    if (rssi >= -60) return 3;
+                    if (rssi >= -70) return 2;
+                    if (rssi >= -80) return 1;
+                    return 0;
+                };
+                bool status_changed = (cur_status != prev_wifi_status);
+                bool bars_changed   = (rssi_bars(cur_rssi) != rssi_bars(prev_wifi_rssi));
+                if (status_changed || bars_changed) {
+                    drawWifiStatusStrip(wifi_status_x, wifi_status_y,
+                                        wifi_status_w, wifi_status_h);
+                    prev_wifi_status = cur_status;
+                    prev_wifi_rssi   = cur_rssi;
+                }
+            }
+        }
+
         delay(1);  // Minimal delay - MIPI-DSI is fast, just yield to other tasks
     }
     
@@ -1492,7 +2122,19 @@ static void runSettingsScreen(void)
         runSettingsScreen();
         return;
     }
-    
+
+    // Handle USB Disk mode
+    if (open_usb) {
+        runUsbMscScreen();
+        // After returning, re-scan the SD so any newly-dropped disk /
+        // ISO images appear in the lists, then re-enter the settings
+        // screen (same pattern used for the WiFi screen).
+        scanDiskFiles();
+        scanCDROMFiles();
+        runSettingsScreen();
+        return;
+    }
+
     // Save settings before booting
     saveSettings();
 }
@@ -1515,7 +2157,24 @@ static int wifi_scroll_offset = 0;
 static void runWiFiScreen(void)
 {
     Serial.println("[BOOT_GUI] Showing WiFi screen...");
-    
+
+    // Immediate "Opening WiFi..." feedback, painted before the slow
+    // bits run (initWiFi() can take ~1-2s on cold boot, and the first
+    // scan kickoff adds more). Without this, tapping the WiFi button
+    // leaves the user staring at the settings screen for a second or
+    // two before anything visibly changes.
+    drawDesktopPattern();
+    drawMenuBar("WiFi Settings");
+    {
+        int cx = SCREEN_WIDTH / 2;
+        int cy = SCREEN_HEIGHT / 2;
+        drawLabelBadge("WiFi Settings", cx, MENU_BAR_HEIGHT + 8,
+                       TC_DATUM, CHI_SCALE_TITLE);
+        drawLabelBadge("Opening WiFi...", cx, cy,
+                       MC_DATUM, CHI_SCALE_BODY);
+    }
+    BoardDisplay_Present();
+
     // Initialize WiFi if not already done
     initWiFi();
     
@@ -1533,46 +2192,70 @@ static void runWiFiScreen(void)
     
     // Layout constants
     int content_x = SCREEN_MARGIN;
-    int content_y = SCREEN_MARGIN + TITLE_BAR_HEIGHT;
+    int content_y = MENU_BAR_HEIGHT + 40;  // Room for title badge.
     int content_w = SCREEN_WIDTH - SCREEN_MARGIN * 2;
     
-    // Network list dimensions
-    int list_w = content_w;
-    int list_h = LIST_ITEM_HEIGHT * 6 + 4;
-    int list_x = content_x;
-    int list_y = content_y + 50;
-    
-    // Status area
-    int status_y = list_y + list_h + 20;
-    
-    // Button dimensions
+    // Button dimensions (defined early so other elements can size against
+    // the bottom button row).
     int btn_w = 180;
-    int btn_h = 60;
+    int btn_h = 50;
     int btn_gap = 20;
     
-    // Scan button
+    // Scan / Connect / Back buttons along the bottom.
     int scan_btn_x = content_x;
     int scan_btn_y = SCREEN_HEIGHT - btn_h - SCREEN_MARGIN;
-    
-    // Connect button
     int connect_btn_x = scan_btn_x + btn_w + btn_gap;
     int connect_btn_y = scan_btn_y;
-    
-    // Back button
     int back_btn_x = SCREEN_WIDTH - SCREEN_MARGIN - btn_w;
     int back_btn_y = scan_btn_y;
     
-    // Password input area
-    int password_y = status_y + 60;
-    int password_w = 500;
+    // Password input area - sits just above the action buttons.
+    int password_w = 640;
+    int password_h = 44;
     int password_x = (SCREEN_WIDTH - password_w) / 2;
-    int password_h = 50;
+    int password_y = scan_btn_y - password_h - 20;
     
-    // Keyboard dimensions
-    int kb_h = KB_KEY_HEIGHT * 5 + KB_KEY_MARGIN * 6;
+    // Status line - one-line badge right under the network list.
+    int status_y = password_y - 34;
+    
+    // Network list - fills the space between the title and the status
+    // line; the list height is adaptive so it doesn't collide with the
+    // password field or buttons.
+    int list_x = content_x;
+    int list_y = content_y + 30;  // Room for the "Networks:" label.
+    int list_w = content_w;
+    int list_max = status_y - list_y - 10;
+    int list_rows = list_max / LIST_ITEM_HEIGHT;
+    if (list_rows < 3) list_rows = 3;
+    if (list_rows > 6) list_rows = 6;
+    int list_h = list_rows * LIST_ITEM_HEIGHT + 4;
+    int visible_count_actual = list_rows;
+    
+    // Keyboard dimensions. Key height shrinks a bit so the keyboard +
+    // input bar fit without eating into the network list's row area.
+    const int KB_ROWS_DRAWN = 5;
+    int kb_key_h = KB_KEY_HEIGHT;
+    int kb_h = kb_key_h * KB_ROWS_DRAWN + KB_KEY_MARGIN * (KB_ROWS_DRAWN + 1);
     int kb_y = SCREEN_HEIGHT - kb_h - 10;
     int kb_x = 50;
     int kb_w = SCREEN_WIDTH - 100;
+
+    // Input bar above the keyboard: contains the password preview and the
+    // big "Done" / "Cancel" buttons so there's always an unmistakable way
+    // to dismiss the on-screen keyboard. Sized to match the existing
+    // kb_y-60 erase region.
+    int ib_y = kb_y - 60;
+    int ib_h = 60;
+    int ib_btn_w  = 150;
+    int ib_btn_h  = 44;
+    int ib_btn_y  = ib_y + (ib_h - ib_btn_h) / 2;
+    int ib_done_x   = SCREEN_WIDTH - SCREEN_MARGIN - ib_btn_w;
+    int ib_cancel_x = ib_done_x - ib_btn_w - 10;
+    int ib_label_x  = SCREEN_MARGIN + 20;
+    int ib_preview_x = ib_label_x + 130;
+    int ib_preview_w = ib_cancel_x - ib_preview_x - 20;
+    int ib_preview_h = ib_btn_h;
+    int ib_preview_y = ib_btn_y;
     
     // State
     bool scanning = false;
@@ -1590,6 +2273,12 @@ static void runWiFiScreen(void)
     bool back_pressed = false;
     bool back_touch_started = false;
     bool password_touched = false;
+
+    // Input-bar (keyboard header) button state.
+    bool ib_done_pressed       = false;
+    bool ib_done_touch_started = false;
+    bool ib_cancel_pressed       = false;
+    bool ib_cancel_touch_started = false;
     
     bool should_exit = false;
     
@@ -1625,6 +2314,8 @@ static void runWiFiScreen(void)
     int prev_kb_highlight = -1;
     bool prev_shift_active = false;
     size_t prev_network_count = 0;
+    bool prev_ib_done_pressed   = false;
+    bool prev_ib_cancel_pressed = false;
     
     while (!should_exit) {
         // Check scan completion
@@ -1693,18 +2384,61 @@ static void runWiFiScreen(void)
         if (getTouchEvent(&touch)) {
             // Handle keyboard input when visible
             if (show_keyboard) {
+                // The input bar above the keyboard owns the "Done" and
+                // "Cancel" buttons. We check those first so a tap on the
+                // header never leaks into the keyboard grid below.
+                bool in_done = isPointInRect(touch.x, touch.y,
+                                             ib_done_x, ib_btn_y,
+                                             ib_btn_w, ib_btn_h);
+                bool in_cancel = isPointInRect(touch.x, touch.y,
+                                               ib_cancel_x, ib_btn_y,
+                                               ib_btn_w, ib_btn_h);
+
                 if (touch.was_pressed) {
-                    kb_highlight = getKeyboardHighlight(touch.x, touch.y, kb_x, kb_y, kb_w, kb_h);
+                    if (in_done) {
+                        ib_done_touch_started = true;
+                        ib_done_pressed       = true;
+                    } else if (in_cancel) {
+                        ib_cancel_touch_started = true;
+                        ib_cancel_pressed       = true;
+                    } else {
+                        kb_highlight = getKeyboardHighlight(touch.x, touch.y, kb_x, kb_y, kb_w, kb_h);
+                    }
                 }
-                
+
                 if (touch.is_pressed) {
-                    kb_highlight = getKeyboardHighlight(touch.x, touch.y, kb_x, kb_y, kb_w, kb_h);
+                    if (ib_done_touch_started) {
+                        ib_done_pressed = in_done;
+                    } else if (ib_cancel_touch_started) {
+                        ib_cancel_pressed = in_cancel;
+                    } else {
+                        kb_highlight = getKeyboardHighlight(touch.x, touch.y, kb_x, kb_y, kb_w, kb_h);
+                    }
                 }
-                
+
                 if (touch.was_released) {
-                    int key = getKeyboardKey(touch.x, touch.y, kb_x, kb_y, kb_w, kb_h);
                     kb_highlight = -1;
-                    
+
+                    // Header-bar buttons take precedence.
+                    if (ib_done_touch_started) {
+                        if (in_done) {
+                            show_keyboard = false;
+                        }
+                        ib_done_touch_started = false;
+                        ib_done_pressed       = false;
+                        continue;
+                    }
+                    if (ib_cancel_touch_started) {
+                        if (in_cancel) {
+                            show_keyboard = false;
+                        }
+                        ib_cancel_touch_started = false;
+                        ib_cancel_pressed       = false;
+                        continue;
+                    }
+
+                    int key = getKeyboardKey(touch.x, touch.y, kb_x, kb_y, kb_w, kb_h);
+
                     if (key == KB_KEY_CANCEL) {
                         show_keyboard = false;
                     } else if (key == KB_KEY_ENTER) {
@@ -1851,31 +2585,30 @@ static void runWiFiScreen(void)
         // Save first_frame state before clearing it
         bool needs_full_draw = first_frame;
         if (first_frame) {
-            // First frame - draw everything
-            gfx.fillScreen(MAC_LIGHT_GRAY);
-            
-            // Draw title
-            gfx.setTextColor(MAC_BLACK);
-            gfx.setTextSize(3);
-            gfx.setTextDatum(TC_DATUM);
-            gfx.drawString("WiFi Settings", SCREEN_WIDTH / 2, SCREEN_MARGIN);
-            
-            // Draw "Networks:" label
-            gfx.setTextSize(2);
-            gfx.setTextDatum(TL_DATUM);
-            gfx.drawString("Networks:", list_x, content_y);
+            // First frame - draw everything with the themed background.
+            drawDesktopPattern();
+            drawMenuBar("WiFi Settings");
+
+            // Section title under the menu bar, badged so it reads
+            // cleanly over the desktop stipple.
+            drawLabelBadge("WiFi Settings", SCREEN_WIDTH / 2,
+                           MENU_BAR_HEIGHT + 8,
+                           TC_DATUM, CHI_SCALE_TITLE);
+
+            // "Networks:" label, also badged.
+            drawLabelBadge("Networks:", list_x, content_y,
+                           TL_DATUM, CHI_SCALE_BODY);
             first_frame = false;
         }
-        
+
         // Draw scanning indicator (only when state changes or first frame)
         if (scanning_changed || needs_full_draw) {
-            // Clear the scanning area
-            gfx.fillRect(SCREEN_WIDTH - SCREEN_MARGIN - 150, content_y, 150, 30, MAC_LIGHT_GRAY);
+            // Clear the scanning area (restore stipple background).
+            fillWithDesktopStipple(SCREEN_WIDTH - SCREEN_MARGIN - 160, content_y - 4, 160, 30);
             if (scanning) {
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(2);
-                gfx.setTextDatum(TR_DATUM);
-                gfx.drawString("Scanning...", SCREEN_WIDTH - SCREEN_MARGIN, content_y);
+                drawLabelBadge("Scanning...",
+                               SCREEN_WIDTH - SCREEN_MARGIN, content_y,
+                               TR_DATUM, CHI_SCALE_BODY);
             }
         }
         
@@ -1884,25 +2617,21 @@ static void runWiFiScreen(void)
             gfx.fillRect(list_x, list_y, list_w, list_h, MAC_WHITE);
             gfx.drawRect(list_x, list_y, list_w, list_h, MAC_BLACK);
             gfx.drawRect(list_x + 1, list_y + 1, list_w - 2, list_h - 2, MAC_BLACK);
-            
-            int visible_count = 6;
-            gfx.setTextSize(2);
-            gfx.setTextDatum(ML_DATUM);
-            
+
+            int visible_count = visible_count_actual;
+
             for (int i = 0; i < visible_count && (i + wifi_scroll_offset) < (int)wifi_networks.size(); i++) {
                 int item_index = i + wifi_scroll_offset;
                 int item_y = list_y + 3 + i * LIST_ITEM_HEIGHT;
                 
                 WiFiNetworkInfo& net = wifi_networks[item_index];
-                
-                // Highlight selected item
+
+                uint16_t fg = MAC_BLACK;
                 if (item_index == wifi_selection_index) {
                     gfx.fillRect(list_x + 3, item_y, list_w - 6, LIST_ITEM_HEIGHT, MAC_BLACK);
-                    gfx.setTextColor(MAC_WHITE);
-                } else {
-                    gfx.setTextColor(MAC_BLACK);
+                    fg = MAC_WHITE;
                 }
-                
+
                 // Draw SSID
                 char ssid_display[32];
                 strncpy(ssid_display, net.ssid, 24);
@@ -1910,7 +2639,9 @@ static void runWiFiScreen(void)
                 if (strlen(net.ssid) > 24) {
                     strcat(ssid_display, "...");
                 }
-                gfx.drawString(ssid_display, list_x + 10, item_y + LIST_ITEM_HEIGHT / 2);
+                Chicago_DrawString(ssid_display, list_x + 10,
+                                   item_y + LIST_ITEM_HEIGHT / 2,
+                                   fg, ML_DATUM, CHI_SCALE_BODY);
                 
                 // Draw signal bars
                 int bars_x = list_x + list_w - 60;
@@ -1950,21 +2681,21 @@ static void runWiFiScreen(void)
                 
                 // Draw lock icon if encrypted
                 if (net.encryption != WIFI_AUTH_OPEN) {
-                    gfx.setTextColor(item_index == wifi_selection_index ? MAC_WHITE : MAC_BLACK);
-                    gfx.drawString("*", list_x + list_w - 90, item_y + LIST_ITEM_HEIGHT / 2);
+                    uint16_t lock_fg = (item_index == wifi_selection_index)
+                                         ? MAC_WHITE : MAC_BLACK;
+                    Chicago_DrawString("*",
+                                       list_x + list_w - 90,
+                                       item_y + LIST_ITEM_HEIGHT / 2,
+                                       lock_fg, ML_DATUM, CHI_SCALE_BODY);
                 }
             }
         }
         
         // Draw status area (only when status changes or first frame)
         if (status_changed || connecting_changed || needs_full_draw) {
-            // Clear status area
-            gfx.fillRect(content_x, status_y, content_w, 30, MAC_LIGHT_GRAY);
-            
-            gfx.setTextColor(MAC_BLACK);
-            gfx.setTextSize(2);
-            gfx.setTextDatum(TL_DATUM);
-            
+            // Clear status area (restore stipple background).
+            fillWithDesktopStipple(content_x - 4, status_y - 4, content_w + 8, 34);
+
             const char* status_text = "Not connected";
             if (wifi_status == WL_CONNECTED) {
                 status_text = "Connected";
@@ -1975,37 +2706,30 @@ static void runWiFiScreen(void)
             } else if (wifi_status == WL_NO_SSID_AVAIL) {
                 status_text = "Network not found";
             }
-            
+
             char status_line[128];
             sprintf(status_line, "Status: %s", status_text);
-            gfx.drawString(status_line, content_x, status_y);
-            
+            drawLabelBadge(status_line, content_x, status_y,
+                           TL_DATUM, CHI_SCALE_BODY);
+
             // Show IP if connected
             if (wifi_status == WL_CONNECTED) {
                 sprintf(status_line, "IP: %s", WiFi.localIP().toString().c_str());
-                gfx.drawString(status_line, content_x + 300, status_y);
+                drawLabelBadge(status_line, content_x + 300, status_y,
+                               TL_DATUM, CHI_SCALE_BODY);
             }
         }
         
-        // Draw password field (only when password changes, keyboard visibility changes, or first frame)
-        if (password_changed || keyboard_changed || needs_full_draw) {
-            // Clear and redraw password area
-            gfx.fillRect(password_x - 130, password_y, password_w + 140, password_h, MAC_LIGHT_GRAY);
-            
-            if (!show_keyboard) {
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(2);
-                gfx.setTextDatum(TL_DATUM);
-                gfx.drawString("Password:", password_x - 120, password_y + 15);
-            }
-            
-            // Password field
+        // Helper lambdas to keep the redraw logic tidy. `drawPasswordField`
+        // paints the boxed entry on the settings page with an asterisked
+        // preview of what's been typed. `drawInputBar` paints the keyboard
+        // header strip (password preview + big Done / Cancel buttons).
+        auto drawPasswordField = [&]() {
             gfx.fillRect(password_x, password_y, password_w, password_h, MAC_WHITE);
             gfx.drawRect(password_x, password_y, password_w, password_h, MAC_BLACK);
-            gfx.drawRect(password_x + 1, password_y + 1, password_w - 2, password_h - 2, MAC_BLACK);
-            
-            // Draw password as dots
-            gfx.setTextDatum(ML_DATUM);
+            gfx.drawRect(password_x + 1, password_y + 1,
+                         password_w - 2, password_h - 2, MAC_BLACK);
+
             int pw_len = strlen(password_buffer);
             if (pw_len > 0) {
                 char password_display[65];
@@ -2013,74 +2737,118 @@ static void runWiFiScreen(void)
                     password_display[i] = '*';
                 }
                 password_display[pw_len] = '\0';
-                gfx.setTextColor(MAC_BLACK);
-                gfx.drawString(password_display, password_x + 10, password_y + password_h / 2);
+                Chicago_DrawString(password_display,
+                                   password_x + 10, password_y + password_h / 2,
+                                   MAC_BLACK, ML_DATUM, CHI_SCALE_BODY);
             } else {
-                gfx.setTextColor(MAC_DARK_GRAY);
-                gfx.drawString("Tap to enter password", password_x + 10, password_y + password_h / 2);
+                Chicago_DrawString("Tap to enter password",
+                                   password_x + 10, password_y + password_h / 2,
+                                   MAC_DARK_GRAY, ML_DATUM, CHI_SCALE_BODY);
             }
+        };
+
+        auto drawInputBar = [&]() {
+            // Gray header strip matching the keyboard frame.
+            gfx.fillRect(0, ib_y, SCREEN_WIDTH, ib_h, MAC_LIGHT_GRAY);
+            gfx.drawFastHLine(0, ib_y, SCREEN_WIDTH, MAC_BLACK);
+
+            // "Password:" label on the left.
+            Chicago_DrawString("Password:", ib_label_x, ib_y + ib_h / 2,
+                               MAC_BLACK, ML_DATUM, CHI_SCALE_BODY);
+
+            // White-backed preview of what's been typed so the user can
+            // verify characters without the password field being visible.
+            gfx.fillRect(ib_preview_x, ib_preview_y,
+                         ib_preview_w, ib_preview_h, MAC_WHITE);
+            gfx.drawRect(ib_preview_x, ib_preview_y,
+                         ib_preview_w, ib_preview_h, MAC_BLACK);
+            gfx.drawRect(ib_preview_x + 1, ib_preview_y + 1,
+                         ib_preview_w - 2, ib_preview_h - 2, MAC_BLACK);
+
+            int pw_len = strlen(password_buffer);
+            if (pw_len > 0) {
+                Chicago_DrawString(password_buffer,
+                                   ib_preview_x + 8,
+                                   ib_preview_y + ib_preview_h / 2,
+                                   MAC_BLACK, ML_DATUM, CHI_SCALE_BODY);
+            } else {
+                Chicago_DrawString("(type your password)",
+                                   ib_preview_x + 8,
+                                   ib_preview_y + ib_preview_h / 2,
+                                   MAC_DARK_GRAY, ML_DATUM, CHI_SCALE_BODY);
+            }
+
+            // Big, unmistakable dismiss buttons.
+            drawButton(ib_cancel_x, ib_btn_y, ib_btn_w, ib_btn_h,
+                       "Cancel", ib_cancel_pressed);
+            drawButton(ib_done_x, ib_btn_y, ib_btn_w, ib_btn_h,
+                       "Done", ib_done_pressed);
+        };
+
+        // Draw password field (only when password changes, keyboard visibility changes, or first frame)
+        if (password_changed || keyboard_changed || needs_full_draw) {
+            // Clear and redraw password area (restore stipple background).
+            fillWithDesktopStipple(content_x - 4, password_y - 4,
+                                   content_w + 8, password_h + 8);
+
+            if (!show_keyboard) {
+                // The field shows an asterisked preview and a "Tap to
+                // enter password" placeholder, so no separate label is
+                // needed on the left.
+                drawPasswordField();
+            }
+            // When the keyboard is visible, the password preview lives on
+            // the input bar instead; leaving the field hidden avoids
+            // duplicating the same text in two places.
         }
-        
+
         // Draw keyboard or buttons depending on mode
         if (keyboard_changed || needs_full_draw) {
             if (show_keyboard) {
-                // Draw keyboard overlay - covers from kb_y-60 to bottom of screen
-                gfx.fillRect(0, kb_y - 60, SCREEN_WIDTH, SCREEN_HEIGHT - kb_y + 60, MAC_LIGHT_GRAY);
-                
-                // Draw current input
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(2);
-                gfx.setTextDatum(MC_DATUM);
-                gfx.drawString(password_buffer, SCREEN_WIDTH / 2, kb_y - 30);
-                
-                // Draw keyboard
+                // Hide the network list and status line while the
+                // keyboard is up so nothing peeks out above the input
+                // bar. We repaint everything from the label row down.
+                fillWithDesktopStipple(0, content_y + 26, SCREEN_WIDTH,
+                                       ib_y - (content_y + 26));
+
+                // Draw input bar + keyboard overlay. The input bar owns
+                // the Done/Cancel buttons that always dismiss the
+                // keyboard; the keys below still accept Enter/Cancel as
+                // secondary shortcuts.
+                drawInputBar();
                 drawKeyboard(kb_x, kb_y, kb_w, kb_h, shift_active, kb_highlight);
             } else {
-                // Clear entire keyboard area (same region that was covered when showing)
-                gfx.fillRect(0, kb_y - 60, SCREEN_WIDTH, SCREEN_HEIGHT - kb_y + 60, MAC_LIGHT_GRAY);
-                
-                // Also redraw the password label since it may have been covered
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(2);
-                gfx.setTextDatum(TL_DATUM);
-                gfx.drawString("Password:", password_x - 120, password_y + 15);
-                
-                // Redraw password field
-                gfx.fillRect(password_x, password_y, password_w, password_h, MAC_WHITE);
-                gfx.drawRect(password_x, password_y, password_w, password_h, MAC_BLACK);
-                gfx.drawRect(password_x + 1, password_y + 1, password_w - 2, password_h - 2, MAC_BLACK);
-                
-                gfx.setTextDatum(ML_DATUM);
-                int pw_len = strlen(password_buffer);
-                if (pw_len > 0) {
-                    char password_display[65];
-                    for (int i = 0; i < pw_len && i < 64; i++) {
-                        password_display[i] = '*';
-                    }
-                    password_display[pw_len] = '\0';
-                    gfx.setTextColor(MAC_BLACK);
-                    gfx.drawString(password_display, password_x + 10, password_y + password_h / 2);
-                } else {
-                    gfx.setTextColor(MAC_DARK_GRAY);
-                    gfx.drawString("Tap to enter password", password_x + 10, password_y + password_h / 2);
-                }
-                
-                // Draw buttons
+                // Keyboard just dismissed. Restore the stipple
+                // background everywhere the keyboard hid content, then
+                // repaint the network list, status line, password
+                // field, and action buttons.
+                fillWithDesktopStipple(0, content_y + 26, SCREEN_WIDTH,
+                                       SCREEN_HEIGHT - (content_y + 26));
+
+                // "Networks:" label was erased by the stipple above.
+                drawLabelBadge("Networks:", list_x, content_y,
+                               TL_DATUM, CHI_SCALE_BODY);
+
+                // Force a full list repaint on the next iteration so
+                // the network list comes back into view.
+                prev_network_count = (size_t)-1;
+                prev_wifi_selection = INT_MIN;
+                prev_wifi_status = (wl_status_t)-1;
+
+                drawPasswordField();
+
                 drawButton(scan_btn_x, scan_btn_y, btn_w, btn_h, "Scan", scan_pressed);
                 drawButton(connect_btn_x, connect_btn_y, btn_w, btn_h, "Connect", connect_pressed);
                 drawButton(back_btn_x, back_btn_y, btn_w, btn_h, "Back", back_pressed);
             }
         } else if (show_keyboard) {
-            // Keyboard visible - update only if something changed
-            if (kb_highlight_changed || shift_changed || password_changed) {
-                // Clear and redraw input area
-                gfx.fillRect(0, kb_y - 60, SCREEN_WIDTH, 50, MAC_LIGHT_GRAY);
-                gfx.setTextColor(MAC_BLACK);
-                gfx.setTextSize(2);
-                gfx.setTextDatum(MC_DATUM);
-                gfx.drawString(password_buffer, SCREEN_WIDTH / 2, kb_y - 30);
-                
-                // Redraw keyboard
+            // Keyboard visible - update only if something changed.
+            bool ib_btn_changed = (ib_done_pressed != prev_ib_done_pressed) ||
+                                   (ib_cancel_pressed != prev_ib_cancel_pressed);
+            if (password_changed || ib_btn_changed) {
+                drawInputBar();
+            }
+            if (kb_highlight_changed || shift_changed) {
                 drawKeyboard(kb_x, kb_y, kb_w, kb_h, shift_active, kb_highlight);
             }
         } else {
@@ -2109,11 +2877,200 @@ static void runWiFiScreen(void)
         prev_kb_highlight = kb_highlight;
         prev_shift_active = shift_active;
         prev_network_count = wifi_networks.size();
+        prev_ib_done_pressed   = ib_done_pressed;
+        prev_ib_cancel_pressed = ib_cancel_pressed;
         
         delay(1);  // Minimal delay - just yield to other tasks
     }
     
     Serial.println("[BOOT_GUI] Exiting WiFi screen");
+}
+
+// ============================================================================
+// USB Disk Mode Screen
+// ============================================================================
+//
+// Paints a full-screen classic-Mac "dialog" explaining that the SD card is
+// now available over USB, then runs the MSC stack on a dedicated FreeRTOS
+// task so our touch loop stays responsive. "Done" tears the stack down and
+// returns to the settings screen, which will re-scan the SD to pick up any
+// newly-copied disk/ISO images.
+
+// Shared context between runUsbMscScreen and its background task. Kept in
+// module scope because the task runs while the touch loop is blocked on
+// touch polling, and passing a pointer to a stack-local struct would be
+// a lifetime hazard if the UI task ever spawns a retry.
+typedef struct {
+    const char       *err;
+    volatile bool     finished;
+} UsbMscTaskCtx;
+
+static void usbMscTask(void *arg)
+{
+    UsbMscTaskCtx *ctx = static_cast<UsbMscTaskCtx *>(arg);
+    UsbMsc_Enter(&ctx->err);
+    // When UsbMsc_Enter returns, SD is remounted and this task is done.
+    ctx->finished = true;
+    vTaskDelete(NULL);
+}
+
+static void runUsbMscScreen(void)
+{
+    Serial.println("[BOOT_GUI] Entering USB Disk screen...");
+
+    if (!UsbMsc_IsSupported()) {
+        // Shouldn't happen - button is hidden - but fail gracefully.
+        Serial.println("[BOOT_GUI] USB MSC not supported in this build");
+        return;
+    }
+
+    // Spin up MSC in a background task so the touch loop keeps polling.
+    UsbMscTaskCtx ctx = { nullptr, false };
+    TaskHandle_t msc_task = nullptr;
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        usbMscTask, "usb_msc", 6144,
+        &ctx, 2, &msc_task, 0);
+    if (rc != pdPASS) {
+        Serial.println("[BOOT_GUI] Failed to create USB MSC task");
+        return;
+    }
+
+    // Layout: tiled desktop background with a centered "alert" panel.
+    drawDesktopPattern();
+    drawMenuBar("USB Disk Mode");
+
+    int panel_w = SCREEN_WIDTH * 3 / 5;
+    int panel_h = 340;
+    int panel_x = (SCREEN_WIDTH - panel_w) / 2;
+    int panel_y = (SCREEN_HEIGHT - panel_h) / 2;
+    drawWindow(panel_x, panel_y, panel_w, panel_h, "USB Disk");
+
+    int text_x = panel_x + 30;
+    int text_y = panel_y + TITLE_BAR_HEIGHT + 30;
+    int line_h = Chicago_LineHeight(CHI_SCALE_BODY) + 4;
+
+    Chicago_DrawString("Your SD card is now available on your",
+                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+    text_y += line_h;
+    Chicago_DrawString("computer as a USB drive.",
+                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+    text_y += line_h * 2;
+
+    Chicago_DrawString("Copy or remove disk images, then tap",
+                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+    text_y += line_h;
+    Chicago_DrawString("\"Done\" to return to the boot menu.",
+                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+    text_y += line_h * 2;
+
+#if defined(BOARD_M5STACK_TAB5)
+    Chicago_DrawString("Note: serial logging and firmware",
+                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM, CHI_SCALE_BODY);
+    text_y += line_h;
+    Chicago_DrawString("upload are paused while this is active.",
+                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM, CHI_SCALE_BODY);
+    text_y += line_h;
+#endif
+
+    // "Done" button at panel bottom.
+    int btn_w = 160;
+    int btn_h = 60;
+    int btn_x = panel_x + (panel_w - btn_w) / 2;
+    int btn_y = panel_y + panel_h - btn_h - 20;
+
+    // Status area just above the button: host mount state, error if any.
+    int status_y = btn_y - 30;
+    auto redrawStatus = [&](bool host_mounted, const char *error) {
+        fillWithDesktopStipple(panel_x + 20, status_y - 8,
+                               panel_w - 40, 24);
+        // The stipple shouldn't extend inside the window, so repaint white
+        // then overlay text.
+        gfx.fillRect(panel_x + 4, status_y - 8,
+                     panel_w - 8, 24, MAC_WHITE);
+        if (error) {
+            Chicago_DrawString(error, panel_x + panel_w / 2, status_y,
+                               MAC_BLACK, MC_DATUM, CHI_SCALE_BODY);
+        } else if (host_mounted) {
+            Chicago_DrawString("Host connected - safe to copy files",
+                               panel_x + panel_w / 2, status_y,
+                               MAC_BLACK, MC_DATUM, CHI_SCALE_BODY);
+        } else {
+            Chicago_DrawString("Waiting for host computer...",
+                               panel_x + panel_w / 2, status_y,
+                               MAC_DARK_GRAY, MC_DATUM, CHI_SCALE_BODY);
+        }
+    };
+
+    bool done_pressed = false;
+    bool prev_done_pressed = false;
+    bool done_touch_started = false;
+    bool prev_host_mounted = !UsbMsc_HostMounted();  // force initial paint
+    const char *prev_err = nullptr;
+    bool        status_drawn = false;
+
+    drawButton(btn_x, btn_y, btn_w, btn_h, "Done", done_pressed);
+
+    bool should_exit = false;
+    TouchEvent touch;
+
+    while (!should_exit) {
+        // Touch handling.
+        if (getTouchEvent(&touch)) {
+            if (touch.was_pressed) {
+                if (isPointInRect(touch.x, touch.y, btn_x, btn_y, btn_w, btn_h)) {
+                    done_touch_started = true;
+                    done_pressed = true;
+                }
+            }
+            if (touch.is_pressed && done_touch_started) {
+                done_pressed = isPointInRect(touch.x, touch.y,
+                                             btn_x, btn_y, btn_w, btn_h);
+            }
+            if (touch.was_released) {
+                if (done_touch_started && done_pressed) {
+                    Serial.println("[BOOT_GUI] USB Disk: Done pressed");
+                    should_exit = true;
+                }
+                done_touch_started = false;
+                done_pressed = false;
+            }
+        }
+
+        // Redraw button on press-state change.
+        if (done_pressed != prev_done_pressed) {
+            drawButton(btn_x, btn_y, btn_w, btn_h, "Done", done_pressed);
+            prev_done_pressed = done_pressed;
+        }
+
+        // Update status line if host mount or error changed.
+        bool host = UsbMsc_HostMounted();
+        if (!status_drawn || host != prev_host_mounted || ctx.err != prev_err) {
+            redrawStatus(host, ctx.err);
+            prev_host_mounted = host;
+            prev_err = ctx.err;
+            status_drawn = true;
+        }
+
+        // If the MSC task finished without user intervention (init failure),
+        // keep any error visible briefly, then bail out.
+        if (ctx.finished && !should_exit) {
+            delay(2000);
+            should_exit = true;
+        }
+
+        delay(1);
+    }
+
+    // Tell the MSC task to wind down, then wait for it to exit.
+    UsbMsc_RequestExit();
+    // Poll ctx.finished rather than the task handle: once the task calls
+    // vTaskDelete(NULL) the handle is no longer safe to inspect.
+    for (int i = 0; i < 200 && !ctx.finished; ++i) {
+        delay(25);
+    }
+    (void)msc_task;  // only used for creation
+
+    Serial.println("[BOOT_GUI] Exiting USB Disk screen");
 }
 
 // ============================================================================
@@ -2158,12 +3115,25 @@ bool BootGUI_Init(void)
     // Scan for disk files
     scanDiskFiles();
     scanCDROMFiles();
+    scanExtFSFolders();
 
     // If no disk is selected but we found some, select the first one
     if (strlen(selected_disk_path) == 0 && disk_files.size() > 0) {
         strncpy(selected_disk_path, disk_files[0].c_str(), BOOT_GUI_MAX_PATH - 1);
         disk_selection_index = 0;
     }
+
+    // Bring up the hosted WiFi transport unconditionally on boards
+    // that have a co-processor (Waveshare) so we can query the slave
+    // firmware version before any autoconnect attempts. If it's out
+    // of sync with the linked host library, stream the embedded
+    // `esp32c6-v<X.Y.Z>.bin` blob into the slave and reboot so WiFi
+    // comes up working. On Tab5 BoardWifi_IsCoprocessorFirmwareOutdated
+    // is a no-op stub so the whole block resolves to a cheap skip.
+#if defined(BOARD_WAVESHARE_P4_101)
+    initWiFi();
+    runC6FirmwareUpdateIfNeeded();
+#endif
 
     // Kick off WiFi auto-connect in the background if configured. The
     // previous countdown screen used to block on this; now we just fire
@@ -2198,11 +3168,33 @@ static void bootGuiCleanupWifi(void)
     WiFi.scanDelete();
     wl_status_t status = WiFi.status();
     if (status != WL_CONNECTED || !BOOTGUI_KEEP_WIFI_FOR_EMULATOR) {
-        Serial.println("[BOOT_GUI] Disconnecting WiFi before emulator start...");
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_OFF);
-        delay(100);
-        wifi_initialized = false;
+        // IMPORTANT: On the Waveshare P4 the WiFi co-processor (ESP32-C6)
+        // talks to us over SDIO via esp_wifi_remote / esp_hosted, and
+        // esp_hosted.a internally uses the SAME esp_driver_sdmmc host
+        // context (s_host_ctx / event_queue in sdmmc_host.c) that slot 0
+        // - the microSD card - depends on. Calling WiFi.mode(WIFI_OFF)
+        // stops esp_wifi_remote, which tears down esp_hosted, which
+        // calls sdmmc_host_deinit() and destroys the shared event queue.
+        // The next SD_MMC.open() on slot 0 then asserts inside
+        // xQueueReceive with a NULL queue handle and the device reboots.
+        //
+        // This only manifested once the C6 firmware fell out of date
+        // ("Version on Host is NEWER than version on co-processor"):
+        // WiFi then never reaches WL_CONNECTED and the non-connected
+        // branch below runs. When WiFi does connect we keep it up, which
+        // is why this bug was silent for a long time.
+        //
+        // The right answer is to simply leave WiFi running. We still
+        // call WiFi.disconnect(false) so any AP association is dropped
+        // and we don't waste RF time, but we never flip the mode to OFF.
+        // The emulator's ether_esp32 init reuses the existing WiFi state
+        // and either picks up the live connection or treats it as "no
+        // network" gracefully. The small extra memory cost is well worth
+        // not bricking SD right before the emulator boots.
+        Serial.println("[BOOT_GUI] Releasing WiFi association before emulator start "
+                       "(leaving stack up to preserve shared SDMMC controller)...");
+        WiFi.disconnect(false);
+        delay(50);
         Serial.println("[BOOT_GUI] WiFi cleanup complete");
     } else {
         Serial.printf("[BOOT_GUI] WiFi connected, keeping connection (IP: %s)\n",
@@ -2281,6 +3273,11 @@ const char* BootGUI_GetDiskPath(void)
 const char* BootGUI_GetCDROMPath(void)
 {
     return selected_cdrom_path;
+}
+
+const char* BootGUI_GetExtFSPath(void)
+{
+    return selected_extfs_path;
 }
 
 uint32_t BootGUI_GetRAMSize(void)

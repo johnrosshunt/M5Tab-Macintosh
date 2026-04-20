@@ -14,3 +14,6 @@ dependencies:
     version: "^1"
   espressif/esp_lcd_jd9365:
     version: "*"
+  # The pre-boot "USB Disk" mode uses Arduino's bundled TinyUSB (via the
+  # USBMSC class in the arduino-esp32 core), so no managed component
+  # dependency is needed for it.

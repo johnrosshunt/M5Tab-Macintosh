@@ -42,3 +42,13 @@ CONFIG_BSP_SPIFFS_MOUNT_POINT="/spiffs"
 CONFIG_BSP_SPIFFS_PARTITION_LABEL="storage"
 CONFIG_BSP_SPIFFS_MAX_FILES=5
 CONFIG_BSP_SPIFFS_FORMAT_ON_MOUNT_FAIL=n
+
+# --- TinyUSB MSC for the pre-boot "USB Disk" mode ---
+# Arduino-ESP32's `USBMSC` class (in cores/esp32/USBMSC.cpp) is guarded by
+# CONFIG_TINYUSB_MSC_ENABLED. Flip it on here so src/basilisk/usb_msc.cpp
+# can expose the microSD as a USB Mass Storage device to a host PC. The
+# OTG controller is shared with the HID host stack used during emulation,
+# but the two are mutually exclusive in time: USB Disk mode runs only in
+# pre-boot, HID host only once the emulator is running.
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=8192

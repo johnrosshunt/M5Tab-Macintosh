@@ -1,0 +1,15 @@
+# M5Stack Tab5 sdkconfig overrides.
+#
+# These Kconfig settings are merged on top of the pioarduino Arduino defaults
+# when building the [env:esp32p4_pioarduino] environment. Currently the only
+# override is enabling the TinyUSB MSC class so the pre-boot "USB Disk" mode
+# in src/basilisk/usb_msc.cpp can expose the SD card as a Mass Storage device.
+#
+# On Tab5 the USB-OTG port is shared between Arduino's CDC (serial) and the
+# TinyUSB MSC driver; only one class is active at a time. Entering USB Disk
+# mode temporarily detaches CDC and attaches MSC, both automatically restored
+# when the user taps "Done".
+
+# --- TinyUSB for the pre-boot "USB Disk" (MSC) mode ---
+CONFIG_TINYUSB_MSC_ENABLED=y
+CONFIG_TINYUSB_MSC_BUFSIZE=8192

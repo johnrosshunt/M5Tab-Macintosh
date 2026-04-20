@@ -3,15 +3,16 @@
 """
 build_assets.py - Convert pre-boot artwork and fonts into RGB565 / C headers.
 
-Reads (all optional):
-    assets/BgTile.png         - tiled background (any small PNG, usually 1x scale)
-    assets/happymacicon.png   - centered icon (RGBA PNG with transparency)
-    assets/fonts/chicago.bdf  - Chicago proportional bitmap font (BDF)
+Reads (all optional, in priority order for the font):
+    assets/BgTile.png          - tiled background (any small PNG, usually 1x scale)
+    assets/happymacicon.png    - centered icon (RGBA PNG with transparency)
+    assets/fonts/pixChicago.ttf - pixel-perfect Chicago TTF (preferred)
+    assets/fonts/chicago.bdf   - Chicago proportional bitmap font (BDF)
 
 Writes:
     src/generated/asset_bg_tile.h
     src/generated/asset_happy_mac.h
-    src/generated/chicago_font.h
+    src/generated/chicago_font_data.h
 
 If a source asset is missing, a compiled-in classic default is used so the
 firmware always builds. Drop real assets into `assets/` to override any of them.
@@ -89,7 +90,16 @@ def _first_existing(directory, basenames):
 SRC_BG_TILE   = _first_existing(ASSETS_DIR, ["BgTile.png", "bgtile.png"])
 SRC_HAPPY_MAC = _first_existing(ASSETS_DIR, ["happymacicon.png", "happymacIcon.png",
                                               "HappyMacIcon.png", "happyMacIcon.png"])
+SRC_FONT_TTF  = _first_existing(FONTS_DIR,  ["pixChicago.ttf", "pixchicago.ttf",
+                                              "PixChicago.ttf", "chicago.ttf",
+                                              "Chicago.ttf"])
 SRC_FONT_BDF  = _first_existing(FONTS_DIR,  ["chicago.bdf", "Chicago.bdf"])
+
+# Pixel size used when rasterizing the TTF. pixChicago is a pixel font where
+# size=12 produces the "canonical" Chicago 12 glyphs at ~3x native pixel
+# scale. Callers pass scale=1 to Chicago_DrawString for body UI text, scale=2
+# for titles.
+CHICAGO_TTF_RENDER_SIZE = 12
 
 OUT_BG_TILE   = os.path.join(GEN_DIR, "asset_bg_tile.h")
 OUT_HAPPY_MAC = os.path.join(GEN_DIR, "asset_happy_mac.h")
@@ -494,6 +504,118 @@ def _parse_bdf(path):
     }
 
 
+def _build_font_from_ttf(path, pixel_size):
+    """Rasterize a TTF pixel-font into the same dict shape as _parse_bdf.
+
+    Each glyph is drawn onto an L-mode canvas, thresholded to 1-bit, cropped
+    to its actual ink bounds, then packed MSB-first row-major into bytes -
+    matching the format the BDF path already emits. Works for any pixel
+    font that renders cleanly with no antialiasing (pixChicago in particular).
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    font = ImageFont.truetype(path, pixel_size)
+    ascent, descent = font.getmetrics()
+    line_height = ascent + descent
+
+    # Render canvas big enough for the widest glyphs with margin. Chicago
+    # glyphs at size=12 top out around 20px wide.
+    canvas_w = max(pixel_size * 4, 32)
+    canvas_h = (ascent + descent) * 2 + 8
+
+    glyphs = {}
+    first_cp = 0x20
+    last_cp  = 0x7E
+
+    for cp in range(first_cp, last_cp + 1):
+        ch = chr(cp)
+
+        # Advance width (pen advance after this glyph).
+        try:
+            advance = int(round(font.getlength(ch)))
+        except AttributeError:
+            # Pillow <8: fall back to getsize
+            advance = font.getsize(ch)[0]
+
+        # Space never has pixels - short-circuit.
+        if cp == 0x20:
+            glyphs[cp] = {
+                "w": 0, "h": 0, "bbx_x": 0, "bbx_y": 0,
+                "advance": max(1, advance),
+                "rows": [],
+            }
+            continue
+
+        img = Image.new("L", (canvas_w, canvas_h), 0)
+        draw = ImageDraw.Draw(img)
+        # Draw at (0, 0) - the baseline ends up at y=ascent.
+        draw.text((0, 0), ch, font=font, fill=255)
+
+        # Threshold to 1-bit.
+        pixels = img.load()
+        ink_pts = []
+        for y in range(canvas_h):
+            for x in range(canvas_w):
+                if pixels[x, y] >= 128:
+                    ink_pts.append((x, y))
+
+        if not ink_pts:
+            glyphs[cp] = {
+                "w": 0, "h": 0, "bbx_x": 0, "bbx_y": 0,
+                "advance": max(1, advance),
+                "rows": [],
+            }
+            continue
+
+        x_min = min(p[0] for p in ink_pts)
+        x_max = max(p[0] for p in ink_pts)
+        y_min = min(p[1] for p in ink_pts)
+        y_max = max(p[1] for p in ink_pts)
+
+        bbx_w = x_max - x_min + 1
+        bbx_h = y_max - y_min + 1
+
+        # bbx_x (left side bearing) and bbx_y (bitmap-bottom relative to
+        # baseline, positive = up) follow the BDF convention that the
+        # existing chicago_font.cpp renderer expects.
+        bbx_x = x_min
+        bbx_y = ascent - y_max - 1  # y_max is distance from canvas top to bitmap bottom
+
+        # Pack rows MSB-first, padded to whole bytes per row.
+        bytes_per_row = (bbx_w + 7) // 8
+        ink_set = set(ink_pts)
+        rows = []
+        for ry in range(bbx_h):
+            row_bytes = bytearray(bytes_per_row)
+            for rx in range(bbx_w):
+                if (x_min + rx, y_min + ry) in ink_set:
+                    byte_idx = rx // 8
+                    bit_idx  = 7 - (rx % 8)
+                    row_bytes[byte_idx] |= (1 << bit_idx)
+            rows.append(bytes(row_bytes))
+
+        glyphs[cp] = {
+            "w": bbx_w,
+            "h": bbx_h,
+            "bbx_x": bbx_x,
+            "bbx_y": bbx_y,
+            "advance": max(1, advance),
+            "rows": rows,
+        }
+
+    # Guarantee a minimal space glyph even if the TTF didn't produce one.
+    if 0x20 not in glyphs:
+        glyphs[0x20] = {"w": 0, "h": 0, "bbx_x": 0, "bbx_y": 0,
+                        "advance": max(3, pixel_size // 3), "rows": []}
+
+    return {
+        "ascent": ascent,
+        "descent": descent,
+        "line_height": line_height,
+        "glyphs": glyphs,
+    }
+
+
 def _build_font_from_5x7():
     """Construct a font dict equivalent to _parse_bdf from the 5x7 fallback."""
     glyphs = {}
@@ -608,12 +730,21 @@ def emit_happy_mac(src_path, out_path):
 # ---------------------------------------------------------------------------
 
 def emit_chicago_font(src_path, out_path):
-    if os.path.exists(src_path):
+    # Preference order: TTF (pixChicago) -> BDF -> 5x7 stub. src_path points at
+    # the BDF slot for the _needs_rebuild() timestamp check; the TTF path is
+    # consulted independently below.
+    if os.path.exists(SRC_FONT_TTF) and _try_import_pillow():
+        font = _build_font_from_ttf(SRC_FONT_TTF, CHICAGO_TTF_RENDER_SIZE)
+        label = "%s @ size=%d" % (
+            os.path.relpath(SRC_FONT_TTF, _PROJECT_ROOT),
+            CHICAGO_TTF_RENDER_SIZE,
+        )
+    elif os.path.exists(src_path):
         font = _parse_bdf(src_path)
         label = os.path.relpath(src_path, _PROJECT_ROOT)
     else:
         font = _build_font_from_5x7()
-        label = "<built-in 5x7 ASCII fallback - drop assets/fonts/chicago.bdf to override>"
+        label = "<built-in 5x7 ASCII fallback - drop assets/fonts/pixChicago.ttf to override>"
 
     first_cp = 0x20
     last_cp = 0x7E
@@ -682,13 +813,15 @@ def emit_chicago_font(src_path, out_path):
 def build_all(force=False):
     _ensure_gen_dir()
     tasks = [
-        (SRC_BG_TILE,   OUT_BG_TILE,   emit_bg_tile),
-        (SRC_HAPPY_MAC, OUT_HAPPY_MAC, emit_happy_mac),
-        (SRC_FONT_BDF,  OUT_FONT,      emit_chicago_font),
+        (SRC_BG_TILE,   OUT_BG_TILE,   emit_bg_tile,     [SRC_BG_TILE]),
+        (SRC_HAPPY_MAC, OUT_HAPPY_MAC, emit_happy_mac,   [SRC_HAPPY_MAC]),
+        # Font depends on both the TTF and BDF slots; whichever is newer
+        # triggers a regeneration.
+        (SRC_FONT_BDF,  OUT_FONT,      emit_chicago_font, [SRC_FONT_TTF, SRC_FONT_BDF]),
     ]
     any_written = False
-    for src, dst, fn in tasks:
-        if force or _needs_rebuild(dst, [src]):
+    for src, dst, fn, deps in tasks:
+        if force or _needs_rebuild(dst, deps):
             fn(src, dst)
             any_written = True
     if not any_written:

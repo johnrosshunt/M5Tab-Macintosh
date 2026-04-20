@@ -243,8 +243,22 @@ void SCSIExit(void) {}
  */
 
 const char *GetString(int num) {
-    // Return empty string for unknown string IDs
+    // Look up a localized string from the common + platform tables defined
+    // in user_strings.cpp and user_strings_esp32.cpp. Both tables are NULL-
+    // terminated with an entry of {-1, NULL}. This is the same convention
+    // the upstream Unix/BeOS ports use; our original stub returned "" for
+    // every id which broke anything that depends on a non-empty string
+    // (e.g. ExtFS uses STR_EXTFS_VOLUME_NAME to label the mounted volume).
+    for (int i = 0; common_strings[i].num >= 0; i++) {
+        if (common_strings[i].num == num) {
+            return common_strings[i].str;
+        }
+    }
+    for (int i = 0; platform_strings[i].num >= 0; i++) {
+        if (platform_strings[i].num == num) {
+            return platform_strings[i].str;
+        }
+    }
     static const char *empty = "";
-    (void)num;
     return empty;
 }

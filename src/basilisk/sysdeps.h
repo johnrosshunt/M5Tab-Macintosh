@@ -48,8 +48,10 @@ using std::vector;
 // No prefetch buffer needed
 #define USE_PREFETCH_BUFFER 0
 
-// ExtFS not supported on ESP32
-#define SUPPORTS_EXTFS 0
+// ExtFS (shared host folder mounted as a Mac volume) is supported on ESP32.
+// The host backend lives in extfs_esp32.cpp and stores Finder info + resource
+// forks as .finf/ and .rsrc/ sidecar dirs since FAT/exFAT has no xattrs.
+#define SUPPORTS_EXTFS 1
 
 // No UDP tunnel support
 #define SUPPORTS_UDP_TUNNEL 0

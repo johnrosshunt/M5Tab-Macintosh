@@ -84,6 +84,17 @@ const char* BootGUI_GetDiskPath(void);
 const char* BootGUI_GetCDROMPath(void);
 
 /*
+ *  Get the selected shared-folder path for ExtFS.
+ *
+ *  The returned string is SD-root-relative (e.g. "/Shared"). Callers that
+ *  need a VFS path must prepend BOARD_SD_MOUNT_POINT ("/" on Tab5, "/sd"
+ *  on Waveshare) themselves.
+ *
+ *  Returns an empty string if the user picked "None" / disabled ExtFS.
+ */
+const char* BootGUI_GetExtFSPath(void);
+
+/*
  *  Get the selected RAM size in bytes
  *  Returns RAM size (e.g., 8 * 1024 * 1024 for 8MB)
  */

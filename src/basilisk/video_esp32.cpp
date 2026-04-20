@@ -156,6 +156,14 @@ static int dirty_tile_count = 0;                             // Count of dirty t
 // solid gray in between. Cleared by the task itself on first real write.
 static volatile bool preserve_splash_until_first_write = false;
 
+// Timestamp (millis()) when the preserve-splash gate was armed. Used as a
+// safety ceiling so a pathological ROM that keeps writing uniform frames
+// can't pin the splash forever - after this window elapses we hand off
+// unconditionally. In practice Mac OS paints the 50% gray desktop stipple
+// within a few hundred ms, so 5 s is plenty of headroom.
+static volatile uint32 preserve_splash_armed_ms = 0;
+#define PRESERVE_SPLASH_MAX_MS 5000
+
 // PSRAM strip buffer for row-span merging optimization.
 // Holds one full-width row: 1280 pixels × 80 display-rows × 2 bytes = 204,800 bytes.
 // Adjacent dirty tiles in the same row are composed here and pushed with a single
@@ -750,6 +758,91 @@ static int collectWriteDirtyTiles(void)
 }
 
 /*
+ *  Cheap "is the Mac framebuffer all one value?" check used by the splash
+ *  handoff gate. Mac OS's first few framebuffer writes are typically a
+ *  uniform clear (all 0x00 / 0xFF / similar); blitting those over our
+ *  pre-boot checkerboard looks like a black flash, so we keep the splash
+ *  up until the frame actually has content variation.
+ *
+ *  We sample the corners + center of every currently-dirty tile (7 bytes
+ *  per tile). If all samples match across every dirty tile, the frame is
+ *  considered uniform. Short-circuits as soon as a mismatch is found.
+ */
+static bool frame_is_uniform(uint8 *src_buffer)
+{
+    if (!src_buffer) return true;
+
+    video_depth depth = current_depth;
+    uint32 bpr = current_bytes_per_row;
+
+    // Pick the reference byte from the first dirty tile we find.
+    bool have_ref = false;
+    uint8 ref = 0;
+
+    for (int ty = 0; ty < TILES_Y; ty++) {
+        for (int tx = 0; tx < TILES_X; tx++) {
+            int tile_idx = ty * TILES_X + tx;
+            int word = tile_idx >> 5;
+            int bit  = tile_idx & 31;
+            if ((dirty_tiles[word] & (1u << bit)) == 0) continue;
+
+            int tile_x_px = tx * TILE_WIDTH;
+            int tile_y_px = ty * TILE_HEIGHT;
+
+            // Convert pixel x into a byte offset within the row. This is
+            // approximate for packed modes (we only use it for sampling),
+            // and it's correct for the default 8-bit path Mac OS boots in.
+            int byte_x_left;
+            int byte_x_right;
+            if (depth == VDEPTH_8BIT) {
+                byte_x_left  = tile_x_px;
+                byte_x_right = tile_x_px + TILE_WIDTH - 1;
+            } else {
+                int ppb = current_pixels_per_byte;
+                if (ppb <= 0) ppb = 1;
+                byte_x_left  = tile_x_px / ppb;
+                byte_x_right = (tile_x_px + TILE_WIDTH - 1) / ppb;
+            }
+
+            int y_top    = tile_y_px;
+            int y_bot    = tile_y_px + TILE_HEIGHT - 1;
+            int y_mid    = tile_y_px + TILE_HEIGHT / 2;
+            int byte_x_mid = (byte_x_left + byte_x_right) / 2;
+
+            const int sample_count = 7;
+            const struct { int x; int y; } samples[sample_count] = {
+                { byte_x_left,  y_top },
+                { byte_x_right, y_top },
+                { byte_x_left,  y_bot },
+                { byte_x_right, y_bot },
+                { byte_x_mid,   y_mid },
+                { byte_x_left,  y_mid },
+                { byte_x_right, y_mid },
+            };
+
+            for (int s = 0; s < sample_count; s++) {
+                int sx = samples[s].x;
+                int sy = samples[s].y;
+                if (sy < 0 || sy >= MAC_SCREEN_HEIGHT) continue;
+                if (sx < 0 || sx >= (int)bpr) continue;
+                uint8 v = src_buffer[(uint32)sy * bpr + (uint32)sx];
+                if (!have_ref) {
+                    ref = v;
+                    have_ref = true;
+                } else if (v != ref) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // If we didn't sample anything (no dirty tiles), treat as uniform so the
+    // caller keeps the splash up; the main gate already handles the
+    // dirty_tile_count==0 case before us.
+    return true;
+}
+
+/*
  *  Copy a single tile's source data from framebuffer to a snapshot buffer
  *  This creates a consistent snapshot of the tile to avoid race conditions
  *  when the CPU is writing to the framebuffer while we're rendering.
@@ -1120,18 +1213,39 @@ static void videoRenderTaskOptimized(void *param)
         perf_detect_us += (t1 - t0);
 
         // Keep the pre-boot splash on screen until Mac OS actually writes
-        // to the frame buffer. If we're still in that window and nothing
-        // has been dirtied yet, skip the push entirely (no blank gray
-        // frame between checkerboard and Mac boot). The moment the first
-        // real write lands we fall through and do the full-frame push
-        // that force_full_update requested during VideoInit.
+        // something with real content to the frame buffer. If we're still
+        // in that window and nothing has been dirtied yet, skip the push
+        // entirely.
+        //
+        // Mac OS's first few framebuffer writes are typically a uniform
+        // clear (all 0x00 or 0xFF) - pushing those looks like a black
+        // flash between our checkerboard splash and the Mac boot desktop.
+        // We keep the splash up until the frame has content variation
+        // (desktop stipple / menu bar pixels). A 5-second safety timeout
+        // prevents pinning the splash if something weird happens.
         if (preserve_splash_until_first_write) {
             if (dirty_tile_count == 0) {
                 perf_skip_count++;
                 continue;
             }
+
+            uint32 splash_elapsed = millis() - preserve_splash_armed_ms;
+            bool   timed_out      = splash_elapsed >= PRESERVE_SPLASH_MAX_MS;
+
+            if (!timed_out && frame_is_uniform(mac_frame_buffer)) {
+                // Still in clear-screen phase: throw the dirty bits away
+                // so we don't accumulate, and wait for a richer frame.
+                for (int i = 0; i < (TOTAL_TILES + 31) / 32; i++) {
+                    dirty_tiles[i] = 0;
+                }
+                dirty_tile_count = 0;
+                perf_skip_count++;
+                continue;
+            }
+
             preserve_splash_until_first_write = false;
-            Serial.println("[VIDEO] First Mac OS write detected, handing off from splash");
+            Serial.printf("[VIDEO] First Mac OS content detected (%s), handing off from splash\n",
+                          timed_out ? "safety-timeout" : "non-uniform");
         }
 
         // If force_full_update is set (palette change, first frame), mark ALL tiles dirty
@@ -1225,6 +1339,7 @@ bool VideoInit(bool classic)
     // which point the video task (below) will push real tiles over it.
     // preserve_splash_until_first_write gates that handoff.
     preserve_splash_until_first_write = true;
+    preserve_splash_armed_ms = millis();
     Serial.println("[VIDEO] Splash preserved until first Mac OS write");
     
     // Set up Mac frame buffer pointers

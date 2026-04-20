@@ -158,6 +158,7 @@ uint64_t getEmulatorTotalInstructions(void)
 // Global emulator state
 static bool emulator_running = false;
 static uint32 last_disk_flush_time = 0;
+static uint32 last_xpram_flush_time = 0;
 
 // Video signal interval (ms) - how often to signal video task
 // The video task runs at its own pace, this just triggers buffer swap
@@ -165,6 +166,11 @@ static uint32 last_disk_flush_time = 0;
 
 // Disk flush interval (ms) - how often to flush write buffer to SD card
 #define DISK_FLUSH_INTERVAL 120000  // 120 seconds
+
+// XPRAM flush cadence (ms). SaveXPRAM() short-circuits when nothing changed,
+// so a short interval is cheap and bounds the data-loss window after a PRAM
+// poke to ~30 s even if the device is power-cut without a clean shutdown.
+#define XPRAM_FLUSH_INTERVAL 30000  // 30 seconds
 
 // FreeRTOS timers for periodic emulator events
 static TimerHandle_t timer_60hz = NULL;
@@ -591,7 +597,8 @@ static void RunEmulator(void)
     
     emulator_running = true;
     last_disk_flush_time = millis();
-    
+    last_xpram_flush_time = last_disk_flush_time;
+
     // Start the 68k CPU - this function runs the emulation loop
     // It will return when QuitEmulator() is called
     Start680x0();
@@ -678,6 +685,15 @@ void basilisk_loop(void)
         uint32 t1 = micros();
         perf_flush_us += (t1 - t0);
         perf_flush_count++;
+    }
+
+    // Periodic XPRAM flush. SaveXPRAM() is a memcmp-gated no-op when nothing
+    // changed, so this is essentially free unless Mac OS actually poked PRAM.
+    // Ensures user settings (startup disk, sound volume, etc.) survive a
+    // power-cut without a clean shutdown.
+    if (current_time - last_xpram_flush_time >= XPRAM_FLUSH_INTERVAL) {
+        last_xpram_flush_time = current_time;
+        SaveXPRAM();
     }
     
     // NOTE: Input polling (M5.update + InputPoll) is now handled by a dedicated
