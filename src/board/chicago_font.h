@@ -15,7 +15,8 @@
 #include "board_display.h"   /* pulls in TL_DATUM / MC_DATUM for the active backend */
 
 /**
- * @brief Draw a NUL-terminated string in Chicago, scaled up by `scale`.
+ * @brief Draw a NUL-terminated string in Chicago at its native pixel-perfect
+ *        size (no scaling). One source pixel maps to one framebuffer pixel.
  *
  * The string is laid out along the baseline, then (x, y) is adjusted by the
  * supplied text `datum` (matches LovyanGFX / MiniGfx semantics - TL_DATUM,
@@ -25,14 +26,13 @@
  */
 void Chicago_DrawString(const char *s, int x, int y,
                         uint16_t fg,
-                        uint8_t  datum = TL_DATUM,
-                        int      scale = 2);
+                        uint8_t  datum = TL_DATUM);
 
-/** @brief Pixel width a string will take when rendered at `scale`. */
-int Chicago_MeasureWidth(const char *s, int scale = 2);
+/** @brief Pixel width a string will take when rendered at native size. */
+int Chicago_MeasureWidth(const char *s);
 
-/** @brief Line height (ascent+descent) at `scale`. */
-int Chicago_LineHeight(int scale = 2);
+/** @brief Line height (ascent+descent) at native size. */
+int Chicago_LineHeight(void);
 
 /* ------------------------------------------------------------------------- */
 /* Simple blit helpers used by the Mac splash; live next to the font because */

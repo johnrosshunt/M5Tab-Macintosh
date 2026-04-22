@@ -134,6 +134,12 @@ void setup(void)
     basilisk_setup();
 
     Serial.println("[MAIN] Emulator exited");
+
+    /* Paint a classic "it is now safe to switch off your computer"
+     * screen so the user isn't left with the stale last Mac framebuffer
+     * (which previously showed as a cyan smear). loop() below keeps the
+     * device idle so nothing repaints over this. */
+    MacSplash::ShowSafeToPowerOff();
 }
 
 /* ============================================================================

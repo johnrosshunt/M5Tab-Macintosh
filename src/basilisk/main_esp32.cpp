@@ -10,10 +10,6 @@
 
 #include "sysdeps.h"
 
-#if defined(BOARD_M5STACK_TAB5)
-#include <M5Unified.h>
-#include <M5GFX.h>
-#endif
 #include "board_config.h"
 #include "board_display.h"
 #include "board_sd.h"  /* SD_FS alias */
@@ -341,27 +337,16 @@ void ErrorAlert(const char *text)
 {
     Serial.printf("[ERROR] %s\n", text);
 
-    // Also display on screen if possible. TFT_RED/TFT_WHITE are LovyanGFX
-    // constants; on boards that don't use LovyanGFX we pass equivalent
-    // RGB565 colors directly.
-#if defined(BOARD_M5STACK_TAB5)
+    // Also display on screen. Both boards now use the MiniGfx software
+    // framebuffer behind BoardDisplay_Gfx(); RGB565 colors go in directly.
     auto &gfx = BoardDisplay_Gfx();
-    gfx.fillScreen(TFT_RED);
-    gfx.setTextColor(TFT_WHITE);
-    gfx.setTextSize(2);
-    gfx.setTextDatum(TL_DATUM);
-    gfx.drawString("BasiliskII Error:", 10, 10);
-    gfx.drawString(text, 10, 40);
-#else
-    auto &gfx = BoardDisplay_Gfx();
-    gfx.fillScreen(0xF800u);  /* TFT_RED   in RGB565 */
-    gfx.setTextColor(0xFFFFu); /* TFT_WHITE in RGB565 */
+    gfx.fillScreen(0xF800u);  /* red   */
+    gfx.setTextColor(0xFFFFu); /* white */
     gfx.setTextSize(2);
     gfx.setTextDatum(TL_DATUM);
     gfx.drawString("BasiliskII Error:", 10, 10);
     gfx.drawString(text, 10, 40);
     gfx.flushAll();
-#endif
 }
 
 /*

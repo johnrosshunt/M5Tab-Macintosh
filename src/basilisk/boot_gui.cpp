@@ -15,14 +15,11 @@
  */
 
 #include <Arduino.h>
-#if defined(BOARD_M5STACK_TAB5)
-#include <M5Unified.h>
-#include <M5GFX.h>
-#endif
 #include <WiFi.h>
 #include <vector>
 #include <string>
 #include <climits>
+#include <time.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/queue.h>
@@ -94,10 +91,9 @@ static void touchTask(void* param)
         // Refresh the board's cached touch state
         Board_Update();
 
-        // Push any pending framebuffer updates to the panel. On Tab5 this
-        // is a no-op because M5.Display writes are synchronous; on
-        // Waveshare it flushes the MiniGfx PSRAM framebuffer to the
-        // MIPI-DSI back buffer so the user sees fresh redraws.
+        // Push any pending framebuffer updates to the panel. Both
+        // boards flush the MiniGfx PSRAM framebuffer to the MIPI-DSI
+        // back buffer here so the user sees fresh redraws.
         BoardDisplay_Present();
 
         BoardTouchDetail touch = BoardTouch_GetDetail();
@@ -278,18 +274,12 @@ static bool getTouchEvent(TouchEvent* evt)
 #define MAC_DESKTOP     0xA514  // Classic Mac desktop gray pattern base
 
 // ============================================================================
-// Typography scales (passed to Chicago_DrawString)
+// Typography
 // ============================================================================
 // Classic Mac OS used a single 12pt Chicago for menu bar, buttons, dialog
-// titles and body text. We honour that here by defining every scale as
-// `CHI_SCALE` so changing it in one place re-flows the whole UI.
-// pixChicago at scale=1 has a 23px line height, which reads well on the
-// 1280-wide display this boot GUI targets.
-#define CHI_SCALE        1
-#define CHI_SCALE_BODY   CHI_SCALE
-#define CHI_SCALE_BTN    CHI_SCALE
-#define CHI_SCALE_TITLE  CHI_SCALE
-#define CHI_SCALE_MENU   CHI_SCALE
+// titles and body text. Chicago_* renders at the font's native pixel size
+// (23 px line height) - no scaling; that's what keeps the glyphs crisp on
+// a 1280-wide display.
 
 // Menu bar has to be tall enough to comfortably fit a 23px line height
 // with a little breathing room below the baseline.
@@ -363,12 +353,9 @@ static int extfs_scroll_offset = 0;
 
 static bool gui_initialized = false;
 
-// Alias to the board's drawing surface:
-//   Tab5: M5.Display (LovyanGFX / M5GFX - writes straight to the panel)
-//   Waveshare: MiniGfx software framebuffer that flushes via MIPI-DSI
-//
-// Both types expose the same fillRect / drawRect / drawString /
-// drawFastHLine / ... method names this file relies on.
+// Alias to the board's drawing surface. Both boards now use the
+// MiniGfx software framebuffer; it flushes to the panel on the next
+// BoardDisplay_Present().
 #define gfx BoardDisplay_Gfx()
 
 // ============================================================================
@@ -381,7 +368,8 @@ static void scanDiskFiles(void);
 static void scanCDROMFiles(void);
 static void drawDesktopPattern(void);
 static void drawWindow(int x, int y, int w, int h, const char* title);
-static void drawButton(int x, int y, int w, int h, const char* label, bool pressed);
+static void drawButton(int x, int y, int w, int h, const char* label,
+                       bool pressed, bool is_default = false);
 static void drawListBox(int x, int y, int w, int h, const std::vector<std::string>& items, 
                         int selected, int scroll_offset, bool include_none);
 static void drawRadioButton(int x, int y, const char* label, bool selected);
@@ -723,64 +711,9 @@ static void fillWithDesktopStipple(int x, int y, int w, int h)
     }
 }
 
-// Draw a short label with a white "paper" backing and 1px black border so
-// it stays readable when sitting on top of the 50% gray desktop stipple.
-// The (x, y) anchor keeps the same semantics as Chicago_DrawString so this
-// can be used as a drop-in replacement for `Chicago_DrawString(...)` in
-// places where text was previously painted directly onto the pattern.
-#define LABEL_BADGE_PAD_X 6
-#define LABEL_BADGE_PAD_Y 2
-static void drawLabelBadge(const char *text, int x, int y, int datum, int scale)
-{
-    if (!text || !text[0]) return;
-
-    int text_w = Chicago_MeasureWidth(text, scale);
-    int text_h = Chicago_LineHeight(scale);
-    int box_w  = text_w + LABEL_BADGE_PAD_X * 2;
-    int box_h  = text_h + LABEL_BADGE_PAD_Y * 2;
-
-    // Compute the box top-left so it visually wraps the text at its
-    // existing anchor (matching drawString datum semantics).
-    int box_x = x - LABEL_BADGE_PAD_X;
-    int box_y = y - LABEL_BADGE_PAD_Y;
-
-    switch (datum) {
-        case TC_DATUM:
-        case MC_DATUM:
-        case BC_DATUM:
-            box_x = x - box_w / 2;
-            break;
-        case TR_DATUM:
-        case MR_DATUM:
-        case BR_DATUM:
-            box_x = x - text_w - LABEL_BADGE_PAD_X;
-            break;
-        default:
-            box_x = x - LABEL_BADGE_PAD_X;
-            break;
-    }
-
-    switch (datum) {
-        case ML_DATUM:
-        case MC_DATUM:
-        case MR_DATUM:
-            box_y = y - box_h / 2;
-            break;
-        case BL_DATUM:
-        case BC_DATUM:
-        case BR_DATUM:
-            box_y = y - text_h - LABEL_BADGE_PAD_Y;
-            break;
-        default:
-            box_y = y - LABEL_BADGE_PAD_Y;
-            break;
-    }
-
-    gfx.fillRect(box_x, box_y, box_w, box_h, MAC_WHITE);
-    gfx.drawRect(box_x, box_y, box_w, box_h, MAC_BLACK);
-
-    Chicago_DrawString(text, x, y, MAC_BLACK, datum, scale);
-}
+// (drawLabelBadge removed - every label now sits on a real Mac window's
+// white body, so plain Chicago_DrawString reads cleanly without a paper
+// backing hack.)
 
 // ============================================================================
 // Classic Mac menu bar - drawn at the top of every pre-boot screen.
@@ -815,9 +748,34 @@ static void drawAppleGlyph(int x, int y)
     }
 }
 
+// Format a short "H:MM AM"-style clock string into `out` for the right side
+// of the menu bar. If a real wall-clock is available (time() is non-zero),
+// we use it; otherwise we fall back to "uptime" - minutes-since-boot rendered
+// as "00:MM" - so the bar always has something to show without screaming
+// about a missing RTC.
+static void formatMenuClock(char *out, size_t n)
+{
+    time_t now = time(nullptr);
+    if (now > 100000) {  // anything vaguely sane means we have an RTC / NTP
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        int hour12 = tm_now.tm_hour % 12;
+        if (hour12 == 0) hour12 = 12;
+        snprintf(out, n, "%d:%02d %s",
+                 hour12, tm_now.tm_min,
+                 tm_now.tm_hour >= 12 ? "PM" : "AM");
+        return;
+    }
+
+    uint32_t up_s  = millis() / 1000;
+    uint32_t up_m  = up_s / 60;
+    uint32_t up_h  = up_m / 60;
+    snprintf(out, n, "%u:%02u", (unsigned)(up_h % 100), (unsigned)(up_m % 60));
+}
+
 static void drawMenuBar(const char *title)
 {
-    (void)title;  // Screen name is shown as a content-area heading instead.
+    (void)title;  // Screen name is shown as a window title instead.
 
     // Background fill.
     gfx.fillRect(0, 0, SCREEN_WIDTH, MENU_BAR_HEIGHT, MAC_WHITE);
@@ -829,14 +787,20 @@ static void drawMenuBar(const char *title)
 
     // Static menu titles. Purely decorative - these don't open anything.
     int base_x = 40;
-    int text_y = (MENU_BAR_HEIGHT - Chicago_LineHeight(CHI_SCALE_MENU)) / 2;
+    int text_y = (MENU_BAR_HEIGHT - Chicago_LineHeight()) / 2;
     if (text_y < 0) text_y = 0;
     const char *items[] = { "File", "Edit", "View", "Special" };
     for (int i = 0; i < 4; ++i) {
-        Chicago_DrawString(items[i], base_x, text_y, MAC_BLACK, TL_DATUM,
-                           CHI_SCALE_MENU);
-        base_x += Chicago_MeasureWidth(items[i], CHI_SCALE_MENU) + 18;
+        Chicago_DrawString(items[i], base_x, text_y, MAC_BLACK, TL_DATUM);
+        base_x += Chicago_MeasureWidth(items[i]) + 18;
     }
+
+    // Running clock on the right edge, Chicago, right-aligned with 10 px
+    // of padding so it doesn't hug the screen edge.
+    char clock_buf[16];
+    formatMenuClock(clock_buf, sizeof(clock_buf));
+    Chicago_DrawString(clock_buf, SCREEN_WIDTH - 10, text_y,
+                       MAC_BLACK, TR_DATUM);
 }
 
 // Decorative close-box drawn on windows. Matches the classic Mac design:
@@ -851,47 +815,128 @@ static void drawCloseBox(int x, int y)
 // ============================================================================
 // Drawing Functions - Window
 // ============================================================================
+// Classic Mac window chrome:
+//   * 1 px black frame, 2 px black drop shadow on the bottom + right edges.
+//   * Title bar is the classic 6 horizontal hairlines with a centered
+//     white "paper" cutout around the Chicago title. The cutout is only
+//     as wide as the text + 12 px so the stripes flank the title crisply.
+//   * A decorative close-box sits at the top-left. Sub-panel windows
+//     (used for inline group-boxes like the Memory radios) skip the
+//     close-box and use a shorter title strip.
 
-static void drawWindow(int x, int y, int w, int h, const char* title)
+static constexpr int WINDOW_TITLE_STRIPES = 6;
+
+static void drawTitleStripes(int left, int top, int width, int height)
 {
-    // Drop shadow
-    gfx.fillRect(x + 4, y + 4, w, h, MAC_DARK_GRAY);
-    
-    // Window background
-    gfx.fillRect(x, y, w, h, MAC_WHITE);
-    
-    // Window border
-    gfx.drawRect(x, y, w, h, MAC_BLACK);
-    gfx.drawRect(x + 1, y + 1, w - 2, h - 2, MAC_BLACK);
-    
-    // Title bar background with horizontal stripes
-    gfx.fillRect(x + 2, y + 2, w - 4, TITLE_BAR_HEIGHT, MAC_WHITE);
-    for (int ty = y + 4; ty < y + TITLE_BAR_HEIGHT; ty += 2) {
-        gfx.drawFastHLine(x + 2, ty, w - 4, MAC_BLACK);
+    // Paint the striped bar background in black, then carve out
+    // white gaps so we end up with exactly WINDOW_TITLE_STRIPES
+    // horizontal 1 px black lines evenly spread across `height`.
+    if (width <= 0 || height <= 0) return;
+    gfx.fillRect(left, top, width, height, MAC_WHITE);
+
+    // Centre the 6-stripe block vertically; stripes are spaced every 2 px
+    // (1 px black, 1 px white), which matches the original Mac look.
+    int stripe_block = WINDOW_TITLE_STRIPES * 2 - 1;  // 11 px tall
+    int stripe_top   = top + (height - stripe_block) / 2;
+    if (stripe_top < top) stripe_top = top;
+
+    for (int i = 0; i < WINDOW_TITLE_STRIPES; ++i) {
+        int ly = stripe_top + i * 2;
+        if (ly >= top + height) break;
+        gfx.drawFastHLine(left, ly, width, MAC_BLACK);
     }
-    
-    // Title text background (white box in center of title bar)
-    int title_width = Chicago_MeasureWidth(title, CHI_SCALE_TITLE) + 20;
-    int title_x = x + (w - title_width) / 2;
-    gfx.fillRect(title_x, y + 2, title_width, TITLE_BAR_HEIGHT, MAC_WHITE);
+}
 
-    // Title text in Chicago.
-    Chicago_DrawString(title, x + w / 2, y + TITLE_BAR_HEIGHT / 2 + 2,
-                       MAC_BLACK, MC_DATUM, CHI_SCALE_TITLE);
+static void drawWindowEx(int x, int y, int w, int h, const char *title,
+                         bool is_sub_panel)
+{
+    // 2 px black drop shadow along bottom and right edges (classic Mac
+    // "hard" shadow, not the wide gray block we used to draw).
+    gfx.fillRect(x + 2, y + h, w, 2, MAC_BLACK);      // bottom
+    gfx.fillRect(x + w, y + 2, 2, h, MAC_BLACK);      // right
 
-    // Decorative close box at top-left of title bar.
-    drawCloseBox(x + 8, y + (TITLE_BAR_HEIGHT - CLOSE_BOX_SIZE) / 2 + 2);
+    // Window body.
+    gfx.fillRect(x, y, w, h, MAC_WHITE);
+    gfx.drawRect(x, y, w, h, MAC_BLACK);
 
-    // Divider line below title bar
-    gfx.drawFastHLine(x + 2, y + TITLE_BAR_HEIGHT + 2, w - 4, MAC_BLACK);
+    // Title bar geometry. Sub-panels use a shorter bar so the group-box
+    // stays compact inside the main window.
+    int title_h = is_sub_panel ? TITLE_BAR_HEIGHT / 2 : TITLE_BAR_HEIGHT;
+    int title_top = y + 1;
+
+    // Striped title bar (draws over the interior).
+    int stripes_left  = x + 1;
+    int stripes_width = w - 2;
+    drawTitleStripes(stripes_left, title_top, stripes_width, title_h);
+
+    // White "paper" cutout for the title, width = text + 12 px. Chicago
+    // sits vertically centred in the title bar.
+    if (title && title[0]) {
+        int title_paper_w = Chicago_MeasureWidth(title) + 12;
+        int title_paper_x = x + (w - title_paper_w) / 2;
+        gfx.fillRect(title_paper_x, title_top, title_paper_w, title_h,
+                     MAC_WHITE);
+        Chicago_DrawString(title, x + w / 2, title_top + title_h / 2,
+                           MAC_BLACK, MC_DATUM);
+    }
+
+    // Decorative close-box (main windows only).
+    if (!is_sub_panel) {
+        int cb_y = title_top + (title_h - CLOSE_BOX_SIZE) / 2;
+        drawCloseBox(x + 8, cb_y);
+    }
+
+    // 1 px divider under the title bar that completes the classic look.
+    gfx.drawFastHLine(x + 1, title_top + title_h, w - 2, MAC_BLACK);
+}
+
+static void drawWindow(int x, int y, int w, int h, const char *title)
+{
+    drawWindowEx(x, y, w, h, title, /*is_sub_panel=*/false);
+}
+
+static void drawSubPanel(int x, int y, int w, int h, const char *title)
+{
+    drawWindowEx(x, y, w, h, title, /*is_sub_panel=*/true);
+}
+
+// Return the pixel Y offset (relative to window top) at which content
+// drawing starts, i.e. just below the title bar + divider line. Used by
+// callers laying out the inside of a drawWindow / drawSubPanel.
+static int windowContentTop(bool is_sub_panel)
+{
+    int title_h = is_sub_panel ? TITLE_BAR_HEIGHT / 2 : TITLE_BAR_HEIGHT;
+    return 1 + title_h + 1;  // 1 px frame + title bar + 1 px divider
 }
 
 // ============================================================================
 // Drawing Functions - Button
 // ============================================================================
 
-static void drawButton(int x, int y, int w, int h, const char* label, bool pressed)
+// Classic Mac default button has an outer 1 px black ring, a 3 px gap,
+// then the regular 1 px button frame. When painting the halo we need to
+// erase the area with the desktop stipple so multiple repaints don't
+// leave concentric rectangles layered on top of each other.
+static constexpr int DEFAULT_BUTTON_HALO_GAP = 3;
+
+static void drawButton(int x, int y, int w, int h, const char* label,
+                       bool pressed, bool is_default)
 {
+    if (is_default) {
+        // Erase the halo region first so a repaint doesn't leave the
+        // previous ring behind.
+        int halo_pad = DEFAULT_BUTTON_HALO_GAP + 1;
+        fillWithDesktopStipple(x - halo_pad, y - halo_pad,
+                               w + halo_pad * 2, h + halo_pad * 2);
+
+        // Draw the outer black ring.
+        int hx = x - halo_pad;
+        int hy = y - halo_pad;
+        int hw = w + halo_pad * 2;
+        int hh = h + halo_pad * 2;
+        gfx.drawRect(hx, hy, hw, hh, MAC_BLACK);
+    }
+
     uint16_t fg;
     if (pressed) {
         // Pressed state - inverted (classic Mac push-button selected state).
@@ -918,10 +963,10 @@ static void drawButton(int x, int y, int w, int h, const char* label, bool press
         fg = MAC_BLACK;
     }
 
-    // Chicago button label - same scale as every other label, per the
-    // classic "one 12pt Chicago everywhere" rule.
+    // Chicago button label - one native Chicago, per the classic
+    // "single 12 pt Chicago everywhere" rule.
     Chicago_DrawString(label, x + w / 2, y + h / 2, fg,
-                       MC_DATUM, CHI_SCALE_BTN);
+                       MC_DATUM);
 }
 
 // ============================================================================
@@ -933,12 +978,11 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
 {
     // Background
     gfx.fillRect(x, y, w, h, MAC_WHITE);
-    
-    // Thick border for visibility
+
+    // Classic single 1 px black frame plus a 1 px white inset so rows
+    // breathe away from the border.
     gfx.drawRect(x, y, w, h, MAC_BLACK);
-    gfx.drawRect(x + 1, y + 1, w - 2, h - 2, MAC_BLACK);
-    gfx.drawRect(x + 2, y + 2, w - 4, h - 4, MAC_BLACK);
-    
+
     // Calculate visible items
     int visible_count = (h - 6) / LIST_ITEM_HEIGHT;
     int total_items = items.size();
@@ -986,7 +1030,7 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
         char truncated[48];
         strncpy(truncated, item_text, sizeof(truncated) - 1);
         truncated[sizeof(truncated) - 1] = '\0';
-        // Rough char-budget: we have (content_w - 12) pixels at CHI_SCALE_BODY.
+        // Rough char-budget: we have (content_w - 12) pixels at native Chicago.
         // pixChicago glyphs average ~9px at scale=1 => ~one char per 9px.
         int char_budget = (content_w - 12) / 9;
         if (char_budget > 0 && (int)strlen(truncated) > char_budget) {
@@ -995,7 +1039,7 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
         }
 
         Chicago_DrawString(truncated, x + 8, item_y + LIST_ITEM_HEIGHT / 2,
-                           fg, ML_DATUM, CHI_SCALE_BODY);
+                           fg, ML_DATUM);
     }
 
     // ------------------------------------------------------------------
@@ -1026,7 +1070,7 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
                          sb_x + SCROLLBAR_W / 2, sb_y + sb_h - 4,
                          MAC_BLACK);
     }
-    // Shaded thumb showing position.
+    // Solid-with-border elevator thumb (System 7 look).
     if (total_items > visible_count) {
         int track_h    = sb_h - arrow_h * 2;
         int thumb_h    = (track_h * visible_count) / total_items;
@@ -1036,12 +1080,10 @@ static void drawListBox(int x, int y, int w, int h, const std::vector<std::strin
                          (total_items - visible_count);
         if (thumb_pos < 0) thumb_pos = 0;
         int thumb_y    = sb_y + arrow_h + thumb_pos;
-        // 2px "grip" stippling for a classic look.
-        for (int iy = 0; iy < thumb_h; iy += 2) {
-            for (int ix = 2; ix < SCROLLBAR_W - 2; ix += 2) {
-                gfx.fillRect(sb_x + ix, thumb_y + iy, 1, 1, MAC_BLACK);
-            }
-        }
+        gfx.fillRect(sb_x + 2, thumb_y + 1,
+                     SCROLLBAR_W - 4, thumb_h - 2, MAC_LIGHT_GRAY);
+        gfx.drawRect(sb_x + 2, thumb_y + 1,
+                     SCROLLBAR_W - 4, thumb_h - 2, MAC_BLACK);
     }
 }
 
@@ -1068,10 +1110,10 @@ static void drawRadioButton(int x, int y, const char* label, bool selected)
         gfx.fillCircle(cx, cy, r - 6, MAC_BLACK);
     }
 
-    // Label in Chicago. Badged with a white backing so the text is
-    // legible against the 50% gray desktop stipple.
-    drawLabelBadge(label, x + RADIO_SIZE + 10, cy,
-                   ML_DATUM, CHI_SCALE_BODY);
+    // Label in Chicago. Radios now live inside a white window/sub-panel
+    // so no badge backing is needed - plain Chicago reads cleanly.
+    Chicago_DrawString(label, x + RADIO_SIZE + 10, cy,
+                       MAC_BLACK, ML_DATUM);
 }
 
 // ============================================================================
@@ -1103,9 +1145,10 @@ static void drawCheckbox(int x, int y, int size, const char* label, bool checked
         }
     }
 
-    // Label in Chicago. Badged for readability against the stipple.
-    drawLabelBadge(label, x + size + 10, y + size / 2,
-                   ML_DATUM, CHI_SCALE_BODY);
+    // Label in Chicago. Checkbox lives on the main window's white body,
+    // so plain Chicago is crisp without a badge backing.
+    Chicago_DrawString(label, x + size + 10, y + size / 2,
+                       MAC_BLACK, ML_DATUM);
 }
 
 // ============================================================================
@@ -1169,26 +1212,26 @@ static void drawC6FirmwareUpdateSplash(void)
     int panel_y = (SCREEN_HEIGHT - panel_h) / 2;
     drawWindow(panel_x, panel_y, panel_w, panel_h, "Updating WiFi");
 
-    int line_h = Chicago_LineHeight(CHI_SCALE_BODY) + 4;
+    int line_h = Chicago_LineHeight() + 4;
     int text_x = panel_x + panel_w / 2;
     int text_y = panel_y + TITLE_BAR_HEIGHT + 40;
 
     Chicago_DrawString("Updating the WiFi co-processor firmware.",
-                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TC_DATUM);
     text_y += line_h;
     Chicago_DrawString("This only happens once after a firmware update.",
-                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TC_DATUM);
     text_y += line_h * 2;
 
     Chicago_DrawString("Please wait - the device will restart",
-                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TC_DATUM);
     text_y += line_h;
     Chicago_DrawString("automatically when the update is complete.",
-                       text_x, text_y, MAC_BLACK, TC_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TC_DATUM);
     text_y += line_h * 2;
 
     Chicago_DrawString("Do not unplug or power off.",
-                       text_x, text_y, MAC_DARK_GRAY, TC_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_DARK_GRAY, TC_DATUM);
 
     BoardDisplay_Present();
 }
@@ -1316,7 +1359,7 @@ static void drawWifiStatusStrip(int x, int y, int w, int h)
         status_label = "No network";
     }
     Chicago_DrawString(status_label, text_x, inner_y + 4, MAC_BLACK,
-                       TL_DATUM, CHI_SCALE_BODY);
+                       TL_DATUM);
 
     // Second row: SSID (if we have one).
     if (strlen(wifi_ssid) > 0) {
@@ -1324,10 +1367,10 @@ static void drawWifiStatusStrip(int x, int y, int w, int h)
         strncpy(ssid_display, wifi_ssid, sizeof(ssid_display) - 1);
         ssid_display[sizeof(ssid_display) - 1] = '\0';
         Chicago_DrawString(ssid_display, inner_x, inner_y + 28, MAC_BLACK,
-                           TL_DATUM, CHI_SCALE_BODY);
+                           TL_DATUM);
     } else {
         Chicago_DrawString("(no network saved)", inner_x, inner_y + 28, MAC_DARK_GRAY,
-                           TL_DATUM, CHI_SCALE_BODY);
+                           TL_DATUM);
     }
 
     // Third row: IP address (if connected).
@@ -1337,7 +1380,7 @@ static void drawWifiStatusStrip(int x, int y, int w, int h)
         snprintf(ip_display, sizeof(ip_display), "%u.%u.%u.%u",
                  ip[0], ip[1], ip[2], ip[3]);
         Chicago_DrawString(ip_display, inner_x, inner_y + 52, MAC_BLACK,
-                           TL_DATUM, CHI_SCALE_BODY);
+                           TL_DATUM);
     }
 }
 
@@ -1416,7 +1459,7 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
             char label[2] = {row_chars[col], '\0'};
             Chicago_DrawString(label, key_x + key_width / 2,
                                current_y + row_height / 2,
-                               fg, MC_DATUM, CHI_SCALE_BTN);
+                               fg, MC_DATUM);
 
             key_index++;
         }
@@ -1443,7 +1486,7 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
         fg = MAC_BLACK;
     }
     Chicago_DrawString("Shift", current_x + special_key_w / 2,
-                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
+                       bottom_y + row_height / 2, fg, MC_DATUM);
     current_x += special_key_w + KB_KEY_MARGIN;
 
     // Space key (no label).
@@ -1467,7 +1510,7 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
         fg = MAC_BLACK;
     }
     Chicago_DrawString("<--", current_x + special_key_w / 2,
-                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
+                       bottom_y + row_height / 2, fg, MC_DATUM);
     current_x += special_key_w + KB_KEY_MARGIN;
 
     // Enter key
@@ -1481,7 +1524,7 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
         fg = MAC_BLACK;
     }
     Chicago_DrawString("Done", current_x + key_width / 2,
-                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
+                       bottom_y + row_height / 2, fg, MC_DATUM);
     current_x += key_width + KB_KEY_MARGIN;
 
     // Cancel key
@@ -1495,7 +1538,7 @@ static void drawKeyboard(int x, int y, int w, int h, bool shift_active, int high
         fg = MAC_BLACK;
     }
     Chicago_DrawString("Hide", current_x + key_width / 2,
-                       bottom_y + row_height / 2, fg, MC_DATUM, CHI_SCALE_BTN);
+                       bottom_y + row_height / 2, fg, MC_DATUM);
 }
 
 // Get key code from touch position
@@ -1678,21 +1721,37 @@ static void runSettingsScreen(void)
     // ----------------------------------------------------------------
     // Layout
     // ----------------------------------------------------------------
-    // Right sidebar hosts the WiFi button, WiFi status strip, and USB
-    // Disk button so they stack above the (bottom-center) Boot button
-    // without ever overlapping it. The lists and RAM/audio controls get
-    // the rest of the width.
-    int content_x = SCREEN_MARGIN;
-    int content_y = MENU_BAR_HEIGHT + 40;  // Room for title badge.
+    // Everything lives inside one big classic-Mac window centered on the
+    // desktop stipple. The Boot button is the only thing outside - it
+    // floats in the desktop area below the window, giving us the
+    // traditional "action bar" feel without redrawing the window frame
+    // every press.
 
+    // Boot button - docked bottom-center on the desktop.
+    int boot_btn_w = 320;
+    int boot_btn_h = 60;
+    int boot_btn_x = (SCREEN_WIDTH - boot_btn_w) / 2;
+    int boot_btn_y = SCREEN_HEIGHT - boot_btn_h - SCREEN_MARGIN;
+
+    // Main window geometry.
+    int win_x = SCREEN_MARGIN;
+    int win_y = MENU_BAR_HEIGHT + 10;
+    int win_w = SCREEN_WIDTH - SCREEN_MARGIN * 2;
+    int win_h = boot_btn_y - win_y - 15;  // 15 px gap to the Boot halo.
+
+    // Inner content rect of the main window.
+    int inner_pad  = 15;
+    int content_x  = win_x + inner_pad;
+    int content_y  = win_y + windowContentTop(/*is_sub_panel=*/false) + inner_pad;
+    int content_w_full = win_w - inner_pad * 2;
+
+    // Right sidebar hosts the WiFi button, status strip, and USB Disk
+    // button. The main column (lists + memory + audio) gets the rest.
     int sidebar_w = 200;
-    int sidebar_x = SCREEN_WIDTH - SCREEN_MARGIN - sidebar_w;
+    int sidebar_x = content_x + content_w_full - sidebar_w;
     int sidebar_btn_h = 50;
+    int main_w    = sidebar_x - content_x - 20;  // 20 px gutter.
 
-    // Main content column (everything that is NOT in the sidebar).
-    int main_w = sidebar_x - SCREEN_MARGIN - 20;  // 20px gutter.
-
-    // Sidebar: WiFi button / status card / USB Disk button, stacked.
     int wifi_btn_x = sidebar_x;
     int wifi_btn_y = content_y;
     int wifi_btn_w = sidebar_w;
@@ -1709,43 +1768,42 @@ static void runSettingsScreen(void)
     int usb_btn_y = wifi_status_y + wifi_status_h + 10;
     bool usb_available = UsbMsc_IsSupported();
 
-    // Lists: three columns (Hard Disk, CD-ROM, Shared Folder) inside the
-    // main column. At main_w=1020 / list_gap=30 this gives ~320px per list,
-    // which comfortably fits typical Mac filenames at LIST_ITEM_HEIGHT=55
-    // without bleeding into the right-hand WiFi/status/USB sidebar.
+    // Three list columns inside the main column. We only show 5 rows
+    // (not the max 6) so the Memory sub-panel + Audio checkbox fit
+    // cleanly below on a 720 px panel without overflowing the window.
     int list_gap = 30;
     int list_w = (main_w - list_gap * 2) / 3;
-    int list_h = LIST_ITEM_HEIGHT * LIST_MAX_VISIBLE + 4;
+    int list_rows = 5;
+    int list_h = LIST_ITEM_HEIGHT * list_rows + 4;
     int disk_list_x  = content_x;
     int cdrom_list_x = content_x + (list_w + list_gap) * 1;
     int extfs_list_x = content_x + (list_w + list_gap) * 2;
-    int list_y = content_y + 30;  // Room for the "Hard Disk:" label above.
+    int list_y = content_y + 26;  // Room for the "Hard Disk:" label above.
 
-    // RAM radio buttons - below the lists, along the full main column.
-    int ram_y = list_y + list_h + 30;
-    int ram_x = content_x;
-    int radio_start_x = ram_x + 110;
-    int radio_gap = (main_w - 110 - 20) / 4;
+    // Memory group-box: nested sub-panel framing the RAM radios.
+    int mem_panel_x = content_x;
+    int mem_panel_y = list_y + list_h + 24;
+    int mem_panel_w = main_w;
+    int mem_panel_h = RADIO_SIZE + windowContentTop(/*is_sub_panel=*/true) + 24;
+
+    // Actual radio placement, inside the sub-panel interior.
+    int ram_y = mem_panel_y + windowContentTop(/*is_sub_panel=*/true) + 10;
+    int radio_start_x = mem_panel_x + 20;
+    int radio_gap = (mem_panel_w - 40) / 4;
     int radio_region_x = radio_start_x - 5;
     int radio_region_y = ram_y - 5;
     int radio_region_w = radio_gap * 4 + 20;
     int radio_region_h = RADIO_SIZE + 30;
 
-    // Audio checkbox - second row below RAM radios.
-    int audio_y = ram_y + RADIO_SIZE + 30;
+    // Audio checkbox - below the memory group-box.
+    int audio_y = mem_panel_y + mem_panel_h + 20;
     int audio_x = content_x;
-    int audio_checkbox_x = audio_x + 110;
+    int audio_checkbox_x = audio_x;
     int audio_checkbox_size = RADIO_SIZE;
     int audio_region_x = audio_x - 5;
     int audio_region_y = audio_y - 5;
     int audio_region_w = 320;
     int audio_region_h = audio_checkbox_size + 20;
-
-    // Boot button - full-width primary action, docked bottom-center.
-    int boot_btn_w = 320;
-    int boot_btn_h = 60;
-    int boot_btn_x = (SCREEN_WIDTH - boot_btn_w) / 2;
-    int boot_btn_y = SCREEN_HEIGHT - boot_btn_h - SCREEN_MARGIN;
     
     // Debug: Print layout info
     Serial.printf("[BOOT_GUI] Layout: list_y=%d, list_h=%d, item_height=%d\n", list_y, list_h, LIST_ITEM_HEIGHT);
@@ -1967,28 +2025,20 @@ static void runSettingsScreen(void)
         usb_btn_changed  = (usb_pressed != prev_usb_pressed);
         
         if (first_frame) {
-            // First frame - draw everything. Use the tiled 50% gray stipple
-            // as the desktop background so this screen matches the Mac
-            // splash theme.
+            // First frame - draw the desktop, menu bar, the main window
+            // that wraps every control, then every control on top of it.
             drawDesktopPattern();
             drawMenuBar("Boot Settings");
+            drawWindow(win_x, win_y, win_w, win_h, "Boot Settings");
 
-            // Section title under the menu bar. Wrapped in a white label
-            // badge so it reads cleanly on top of the desktop stipple.
-            drawLabelBadge("Boot Settings", SCREEN_WIDTH / 2,
-                           MENU_BAR_HEIGHT + 8,
-                           TC_DATUM, CHI_SCALE_TITLE);
-
-            // Field labels - also badged so they don't bleed into the
-            // 50% gray pattern beneath them.
-            drawLabelBadge("Hard Disk:",     disk_list_x,  content_y,
-                           TL_DATUM, CHI_SCALE_BODY);
-            drawLabelBadge("CD-ROM:",        cdrom_list_x, content_y,
-                           TL_DATUM, CHI_SCALE_BODY);
-            drawLabelBadge("Shared Folder:", extfs_list_x, content_y,
-                           TL_DATUM, CHI_SCALE_BODY);
-            drawLabelBadge("Memory:",        ram_x, ram_y + 10,
-                           TL_DATUM, CHI_SCALE_BODY);
+            // Field labels sit directly on the window's white body now,
+            // so plain Chicago is fine (no badge hack needed).
+            Chicago_DrawString("Hard Disk:",    disk_list_x,  content_y,
+                               MAC_BLACK, TL_DATUM);
+            Chicago_DrawString("CD-ROM:",       cdrom_list_x, content_y,
+                               MAC_BLACK, TL_DATUM);
+            Chicago_DrawString("Shared Folder:", extfs_list_x, content_y,
+                               MAC_BLACK, TL_DATUM);
 
             // Draw lists. Hard Disk has no "None" (the emulator needs a
             // boot volume), CD-ROM and Shared Folder both lead with "None"
@@ -1999,19 +2049,23 @@ static void runSettingsScreen(void)
                         cdrom_selection_index, cdrom_scroll_offset, true);
             drawListBox(extfs_list_x, list_y, list_w, list_h, extfs_folders,
                         extfs_selection_index, extfs_scroll_offset, true);
-            
-            // Draw RAM radio buttons
+
+            // Memory group-box (nested sub-panel) around the RAM radios.
+            drawSubPanel(mem_panel_x, mem_panel_y, mem_panel_w, mem_panel_h,
+                         "Memory");
             drawRadioButton(radio_start_x, ram_y, "4 MB", selected_ram_mb == 4);
             drawRadioButton(radio_start_x + radio_gap, ram_y, "8 MB", selected_ram_mb == 8);
             drawRadioButton(radio_start_x + radio_gap * 2, ram_y, "12 MB", selected_ram_mb == 12);
             drawRadioButton(radio_start_x + radio_gap * 3, ram_y, "16 MB", selected_ram_mb == 16);
-            
+
             // Draw Audio checkbox
             drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
-            
-            // Draw buttons
+
+            // Draw buttons. Boot is the default action so it gets the
+            // classic double-border halo treatment.
             drawButton(wifi_btn_x, wifi_btn_y, wifi_btn_w, wifi_btn_h, "WiFi", wifi_pressed);
-            drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot", boot_pressed);
+            drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot",
+                       boot_pressed, /*is_default=*/true);
             if (usb_available) {
                 drawButton(usb_btn_x, usb_btn_y, usb_btn_w, usb_btn_h,
                            "USB Disk", usb_pressed);
@@ -2042,9 +2096,11 @@ static void runSettingsScreen(void)
             }
 
             if (ram_changed) {
-                // Clear and redraw radio region (restore stipple background).
-                fillWithDesktopStipple(radio_region_x, radio_region_y,
-                                       radio_region_w, radio_region_h);
+                // Clear and redraw radio region. The radios now live on
+                // the Memory sub-panel's white interior, so erase with
+                // white rather than the desktop stipple.
+                gfx.fillRect(radio_region_x, radio_region_y,
+                             radio_region_w, radio_region_h, MAC_WHITE);
                 drawRadioButton(radio_start_x, ram_y, "4 MB", selected_ram_mb == 4);
                 drawRadioButton(radio_start_x + radio_gap, ram_y, "8 MB", selected_ram_mb == 8);
                 drawRadioButton(radio_start_x + radio_gap * 2, ram_y, "12 MB", selected_ram_mb == 12);
@@ -2052,14 +2108,15 @@ static void runSettingsScreen(void)
             }
 
             if (audio_changed) {
-                // Clear and redraw audio checkbox region.
-                fillWithDesktopStipple(audio_region_x, audio_region_y,
-                                       audio_region_w, audio_region_h);
+                // Audio checkbox now sits on the main window's white body.
+                gfx.fillRect(audio_region_x, audio_region_y,
+                             audio_region_w, audio_region_h, MAC_WHITE);
                 drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
             }
             
             if (boot_btn_changed) {
-                drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot", boot_pressed);
+                drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot",
+                           boot_pressed, /*is_default=*/true);
             }
             
             if (wifi_btn_changed) {
@@ -2160,18 +2217,22 @@ static void runWiFiScreen(void)
 
     // Immediate "Opening WiFi..." feedback, painted before the slow
     // bits run (initWiFi() can take ~1-2s on cold boot, and the first
-    // scan kickoff adds more). Without this, tapping the WiFi button
-    // leaves the user staring at the settings screen for a second or
-    // two before anything visibly changes.
+    // scan kickoff adds more). We paint a placeholder window so the
+    // transition from the settings screen looks intentional.
     drawDesktopPattern();
     drawMenuBar("WiFi Settings");
     {
-        int cx = SCREEN_WIDTH / 2;
-        int cy = SCREEN_HEIGHT / 2;
-        drawLabelBadge("WiFi Settings", cx, MENU_BAR_HEIGHT + 8,
-                       TC_DATUM, CHI_SCALE_TITLE);
-        drawLabelBadge("Opening WiFi...", cx, cy,
-                       MC_DATUM, CHI_SCALE_BODY);
+        int placeholder_w = 420;
+        int placeholder_h = 160;
+        int placeholder_x = (SCREEN_WIDTH  - placeholder_w) / 2;
+        int placeholder_y = (SCREEN_HEIGHT - placeholder_h) / 2;
+        drawWindow(placeholder_x, placeholder_y,
+                   placeholder_w, placeholder_h,
+                   "WiFi Settings");
+        Chicago_DrawString("Opening WiFi...",
+                           placeholder_x + placeholder_w / 2,
+                           placeholder_y + placeholder_h / 2 + 10,
+                           MAC_BLACK, MC_DATUM);
     }
     BoardDisplay_Present();
 
@@ -2585,30 +2646,35 @@ static void runWiFiScreen(void)
         // Save first_frame state before clearing it
         bool needs_full_draw = first_frame;
         if (first_frame) {
-            // First frame - draw everything with the themed background.
+            // First frame - draw the themed desktop + menu bar + the
+            // single settings window that frames everything.
             drawDesktopPattern();
             drawMenuBar("WiFi Settings");
 
-            // Section title under the menu bar, badged so it reads
-            // cleanly over the desktop stipple.
-            drawLabelBadge("WiFi Settings", SCREEN_WIDTH / 2,
-                           MENU_BAR_HEIGHT + 8,
-                           TC_DATUM, CHI_SCALE_TITLE);
+            // Main window spans from just under the menu bar to just
+            // above the bottom button row.
+            int wifi_win_x = SCREEN_MARGIN - 8;
+            int wifi_win_y = MENU_BAR_HEIGHT + 10;
+            int wifi_win_w = SCREEN_WIDTH - (SCREEN_MARGIN - 8) * 2;
+            int wifi_win_h = (scan_btn_y - 15) - wifi_win_y;
+            drawWindow(wifi_win_x, wifi_win_y, wifi_win_w, wifi_win_h,
+                       "WiFi Settings");
 
-            // "Networks:" label, also badged.
-            drawLabelBadge("Networks:", list_x, content_y,
-                           TL_DATUM, CHI_SCALE_BODY);
+            // "Networks:" label sits directly on the window's white body.
+            Chicago_DrawString("Networks:", list_x, content_y,
+                               MAC_BLACK, TL_DATUM);
             first_frame = false;
         }
 
         // Draw scanning indicator (only when state changes or first frame)
         if (scanning_changed || needs_full_draw) {
-            // Clear the scanning area (restore stipple background).
-            fillWithDesktopStipple(SCREEN_WIDTH - SCREEN_MARGIN - 160, content_y - 4, 160, 30);
+            // Clear the scanning area with white (window body).
+            gfx.fillRect(SCREEN_WIDTH - SCREEN_MARGIN - 160, content_y - 4,
+                         160, 30, MAC_WHITE);
             if (scanning) {
-                drawLabelBadge("Scanning...",
-                               SCREEN_WIDTH - SCREEN_MARGIN, content_y,
-                               TR_DATUM, CHI_SCALE_BODY);
+                Chicago_DrawString("Scanning...",
+                                   SCREEN_WIDTH - SCREEN_MARGIN, content_y,
+                                   MAC_BLACK, TR_DATUM);
             }
         }
         
@@ -2641,7 +2707,7 @@ static void runWiFiScreen(void)
                 }
                 Chicago_DrawString(ssid_display, list_x + 10,
                                    item_y + LIST_ITEM_HEIGHT / 2,
-                                   fg, ML_DATUM, CHI_SCALE_BODY);
+                                   fg, ML_DATUM);
                 
                 // Draw signal bars
                 int bars_x = list_x + list_w - 60;
@@ -2686,15 +2752,16 @@ static void runWiFiScreen(void)
                     Chicago_DrawString("*",
                                        list_x + list_w - 90,
                                        item_y + LIST_ITEM_HEIGHT / 2,
-                                       lock_fg, ML_DATUM, CHI_SCALE_BODY);
+                                       lock_fg, ML_DATUM);
                 }
             }
         }
         
         // Draw status area (only when status changes or first frame)
         if (status_changed || connecting_changed || needs_full_draw) {
-            // Clear status area (restore stipple background).
-            fillWithDesktopStipple(content_x - 4, status_y - 4, content_w + 8, 34);
+            // Clear status area with white (window body).
+            gfx.fillRect(content_x - 4, status_y - 4,
+                         content_w + 8, 34, MAC_WHITE);
 
             const char* status_text = "Not connected";
             if (wifi_status == WL_CONNECTED) {
@@ -2709,14 +2776,14 @@ static void runWiFiScreen(void)
 
             char status_line[128];
             sprintf(status_line, "Status: %s", status_text);
-            drawLabelBadge(status_line, content_x, status_y,
-                           TL_DATUM, CHI_SCALE_BODY);
+            Chicago_DrawString(status_line, content_x, status_y,
+                               MAC_BLACK, TL_DATUM);
 
             // Show IP if connected
             if (wifi_status == WL_CONNECTED) {
                 sprintf(status_line, "IP: %s", WiFi.localIP().toString().c_str());
-                drawLabelBadge(status_line, content_x + 300, status_y,
-                               TL_DATUM, CHI_SCALE_BODY);
+                Chicago_DrawString(status_line, content_x + 300, status_y,
+                                   MAC_BLACK, TL_DATUM);
             }
         }
         
@@ -2739,11 +2806,11 @@ static void runWiFiScreen(void)
                 password_display[pw_len] = '\0';
                 Chicago_DrawString(password_display,
                                    password_x + 10, password_y + password_h / 2,
-                                   MAC_BLACK, ML_DATUM, CHI_SCALE_BODY);
+                                   MAC_BLACK, ML_DATUM);
             } else {
                 Chicago_DrawString("Tap to enter password",
                                    password_x + 10, password_y + password_h / 2,
-                                   MAC_DARK_GRAY, ML_DATUM, CHI_SCALE_BODY);
+                                   MAC_DARK_GRAY, ML_DATUM);
             }
         };
 
@@ -2754,7 +2821,7 @@ static void runWiFiScreen(void)
 
             // "Password:" label on the left.
             Chicago_DrawString("Password:", ib_label_x, ib_y + ib_h / 2,
-                               MAC_BLACK, ML_DATUM, CHI_SCALE_BODY);
+                               MAC_BLACK, ML_DATUM);
 
             // White-backed preview of what's been typed so the user can
             // verify characters without the password field being visible.
@@ -2770,26 +2837,28 @@ static void runWiFiScreen(void)
                 Chicago_DrawString(password_buffer,
                                    ib_preview_x + 8,
                                    ib_preview_y + ib_preview_h / 2,
-                                   MAC_BLACK, ML_DATUM, CHI_SCALE_BODY);
+                                   MAC_BLACK, ML_DATUM);
             } else {
                 Chicago_DrawString("(type your password)",
                                    ib_preview_x + 8,
                                    ib_preview_y + ib_preview_h / 2,
-                                   MAC_DARK_GRAY, ML_DATUM, CHI_SCALE_BODY);
+                                   MAC_DARK_GRAY, ML_DATUM);
             }
 
-            // Big, unmistakable dismiss buttons.
+            // Big, unmistakable dismiss buttons. Done is the default action
+            // so it gets the classic double-border halo.
             drawButton(ib_cancel_x, ib_btn_y, ib_btn_w, ib_btn_h,
                        "Cancel", ib_cancel_pressed);
             drawButton(ib_done_x, ib_btn_y, ib_btn_w, ib_btn_h,
-                       "Done", ib_done_pressed);
+                       "Done", ib_done_pressed, /*is_default=*/true);
         };
 
         // Draw password field (only when password changes, keyboard visibility changes, or first frame)
         if (password_changed || keyboard_changed || needs_full_draw) {
-            // Clear and redraw password area (restore stipple background).
-            fillWithDesktopStipple(content_x - 4, password_y - 4,
-                                   content_w + 8, password_h + 8);
+            // Clear and redraw password area. Password field lives on the
+            // WiFi window's white body.
+            gfx.fillRect(content_x - 4, password_y - 4,
+                         content_w + 8, password_h + 8, MAC_WHITE);
 
             if (!show_keyboard) {
                 // The field shows an asterisked preview and a "Tap to
@@ -2805,11 +2874,12 @@ static void runWiFiScreen(void)
         // Draw keyboard or buttons depending on mode
         if (keyboard_changed || needs_full_draw) {
             if (show_keyboard) {
-                // Hide the network list and status line while the
-                // keyboard is up so nothing peeks out above the input
-                // bar. We repaint everything from the label row down.
-                fillWithDesktopStipple(0, content_y + 26, SCREEN_WIDTH,
-                                       ib_y - (content_y + 26));
+                // Hide the WiFi window / status / network list while the
+                // keyboard is up. We paint the desktop stipple over the
+                // entire area between the window-top and the input bar
+                // so no window content peeks through.
+                fillWithDesktopStipple(0, MENU_BAR_HEIGHT, SCREEN_WIDTH,
+                                       ib_y - MENU_BAR_HEIGHT);
 
                 // Draw input bar + keyboard overlay. The input bar owns
                 // the Done/Cancel buttons that always dismiss the
@@ -2818,19 +2888,24 @@ static void runWiFiScreen(void)
                 drawInputBar();
                 drawKeyboard(kb_x, kb_y, kb_w, kb_h, shift_active, kb_highlight);
             } else {
-                // Keyboard just dismissed. Restore the stipple
-                // background everywhere the keyboard hid content, then
-                // repaint the network list, status line, password
-                // field, and action buttons.
-                fillWithDesktopStipple(0, content_y + 26, SCREEN_WIDTH,
-                                       SCREEN_HEIGHT - (content_y + 26));
+                // Keyboard just dismissed. Restore the stipple for the
+                // desktop gutter (below the window) and repaint the
+                // WiFi window + all controls from scratch.
+                fillWithDesktopStipple(0, MENU_BAR_HEIGHT, SCREEN_WIDTH,
+                                       SCREEN_HEIGHT - MENU_BAR_HEIGHT);
 
-                // "Networks:" label was erased by the stipple above.
-                drawLabelBadge("Networks:", list_x, content_y,
-                               TL_DATUM, CHI_SCALE_BODY);
+                int wifi_win_x = SCREEN_MARGIN - 8;
+                int wifi_win_y = MENU_BAR_HEIGHT + 10;
+                int wifi_win_w = SCREEN_WIDTH - (SCREEN_MARGIN - 8) * 2;
+                int wifi_win_h = (scan_btn_y - 15) - wifi_win_y;
+                drawWindow(wifi_win_x, wifi_win_y, wifi_win_w, wifi_win_h,
+                           "WiFi Settings");
 
-                // Force a full list repaint on the next iteration so
-                // the network list comes back into view.
+                Chicago_DrawString("Networks:", list_x, content_y,
+                                   MAC_BLACK, TL_DATUM);
+
+                // Force a full list + status repaint on the next iteration
+                // so the network list comes back into view.
                 prev_network_count = (size_t)-1;
                 prev_wifi_selection = INT_MIN;
                 prev_wifi_status = (wl_status_t)-1;
@@ -2838,7 +2913,8 @@ static void runWiFiScreen(void)
                 drawPasswordField();
 
                 drawButton(scan_btn_x, scan_btn_y, btn_w, btn_h, "Scan", scan_pressed);
-                drawButton(connect_btn_x, connect_btn_y, btn_w, btn_h, "Connect", connect_pressed);
+                drawButton(connect_btn_x, connect_btn_y, btn_w, btn_h, "Connect",
+                           connect_pressed, /*is_default=*/true);
                 drawButton(back_btn_x, back_btn_y, btn_w, btn_h, "Back", back_pressed);
             }
         } else if (show_keyboard) {
@@ -2857,7 +2933,8 @@ static void runWiFiScreen(void)
                 drawButton(scan_btn_x, scan_btn_y, btn_w, btn_h, "Scan", scan_pressed);
             }
             if (connect_btn_changed) {
-                drawButton(connect_btn_x, connect_btn_y, btn_w, btn_h, "Connect", connect_pressed);
+                drawButton(connect_btn_x, connect_btn_y, btn_w, btn_h, "Connect",
+                           connect_pressed, /*is_default=*/true);
             }
             if (back_btn_changed) {
                 drawButton(back_btn_x, back_btn_y, btn_w, btn_h, "Back", back_pressed);
@@ -2947,28 +3024,31 @@ static void runUsbMscScreen(void)
 
     int text_x = panel_x + 30;
     int text_y = panel_y + TITLE_BAR_HEIGHT + 30;
-    int line_h = Chicago_LineHeight(CHI_SCALE_BODY) + 4;
+    int line_h = Chicago_LineHeight() + 4;
 
     Chicago_DrawString("Your SD card is now available on your",
-                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TL_DATUM);
     text_y += line_h;
     Chicago_DrawString("computer as a USB drive.",
-                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TL_DATUM);
     text_y += line_h * 2;
 
     Chicago_DrawString("Copy or remove disk images, then tap",
-                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TL_DATUM);
     text_y += line_h;
     Chicago_DrawString("\"Done\" to return to the boot menu.",
-                       text_x, text_y, MAC_BLACK, TL_DATUM, CHI_SCALE_BODY);
+                       text_x, text_y, MAC_BLACK, TL_DATUM);
     text_y += line_h * 2;
 
 #if defined(BOARD_M5STACK_TAB5)
-    Chicago_DrawString("Note: serial logging and firmware",
-                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM, CHI_SCALE_BODY);
+    Chicago_DrawString("Note: serial logging and firmware upload",
+                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM);
     text_y += line_h;
-    Chicago_DrawString("upload are paused while this is active.",
-                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM, CHI_SCALE_BODY);
+    Chicago_DrawString("are disabled while this is active. The",
+                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM);
+    text_y += line_h;
+    Chicago_DrawString("device will reboot when you tap Done.",
+                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM);
     text_y += line_h;
 #endif
 
@@ -2981,23 +3061,21 @@ static void runUsbMscScreen(void)
     // Status area just above the button: host mount state, error if any.
     int status_y = btn_y - 30;
     auto redrawStatus = [&](bool host_mounted, const char *error) {
-        fillWithDesktopStipple(panel_x + 20, status_y - 8,
-                               panel_w - 40, 24);
-        // The stipple shouldn't extend inside the window, so repaint white
-        // then overlay text.
+        // Status sits inside the window's white body, so just wipe
+        // with white before re-rendering the line.
         gfx.fillRect(panel_x + 4, status_y - 8,
                      panel_w - 8, 24, MAC_WHITE);
         if (error) {
             Chicago_DrawString(error, panel_x + panel_w / 2, status_y,
-                               MAC_BLACK, MC_DATUM, CHI_SCALE_BODY);
+                               MAC_BLACK, MC_DATUM);
         } else if (host_mounted) {
             Chicago_DrawString("Host connected - safe to copy files",
                                panel_x + panel_w / 2, status_y,
-                               MAC_BLACK, MC_DATUM, CHI_SCALE_BODY);
+                               MAC_BLACK, MC_DATUM);
         } else {
             Chicago_DrawString("Waiting for host computer...",
                                panel_x + panel_w / 2, status_y,
-                               MAC_DARK_GRAY, MC_DATUM, CHI_SCALE_BODY);
+                               MAC_DARK_GRAY, MC_DATUM);
         }
     };
 
@@ -3008,7 +3086,8 @@ static void runUsbMscScreen(void)
     const char *prev_err = nullptr;
     bool        status_drawn = false;
 
-    drawButton(btn_x, btn_y, btn_w, btn_h, "Done", done_pressed);
+    drawButton(btn_x, btn_y, btn_w, btn_h, "Done", done_pressed,
+               /*is_default=*/true);
 
     bool should_exit = false;
     TouchEvent touch;
@@ -3038,7 +3117,8 @@ static void runUsbMscScreen(void)
 
         // Redraw button on press-state change.
         if (done_pressed != prev_done_pressed) {
-            drawButton(btn_x, btn_y, btn_w, btn_h, "Done", done_pressed);
+            drawButton(btn_x, btn_y, btn_w, btn_h, "Done", done_pressed,
+                       /*is_default=*/true);
             prev_done_pressed = done_pressed;
         }
 
@@ -3102,12 +3182,6 @@ bool BootGUI_Init(void)
     SCREEN_WIDTH  = BoardDisplay_Width();
     SCREEN_HEIGHT = BoardDisplay_Height();
     Serial.printf("[BOOT_GUI] Display size: %dx%d\n", SCREEN_WIDTH, SCREEN_HEIGHT);
-
-#if defined(BOARD_M5STACK_TAB5)
-    // LovyanGFX-specific: set 16-bit color depth for fastest DMA path.
-    // MiniGfx is fixed at RGB565 and has no setColorDepth() method.
-    gfx.setColorDepth(16);
-#endif
 
     // Load saved settings
     loadSettings();

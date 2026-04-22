@@ -5,17 +5,19 @@
  * Coordinate system:
  *   - "Logical" coordinates are landscape (logical_w x logical_h).
  *   - "Physical" panel coordinates are portrait (panel_w x panel_h).
- *   - Rotation is 90 degrees CCW:  (lx, ly) -> (ly, panel_w - 1 - lx)   NO
- *     Actually, to get landscape from portrait we rotate the scan by 90 CW:
- *     logical (lx, ly)  ==>  physical (panel_w - 1 - ly, lx)
- *
- *   Verification:
+ *   - Default rotation is 90 degrees CW scan:
+ *       logical (lx, ly)  ==>  physical (panel_w - 1 - ly, lx)
  *     - logical (0, 0)          -> physical (panel_w - 1, 0)          -- top-right
  *     - logical (logical_w-1,0) -> physical (panel_w - 1, logical_w-1)-- bottom-right
- *     - logical (0, logical_h-1)-> physical (panel_w - 1 - (logical_h-1), 0)
+ *     - logical (0, logical_h-1)-> physical (0, 0)
+ *   - When setFlip180(true) is active the landscape view is rotated 180
+ *     degrees on the panel, which is equivalent to a 90 CCW scan:
+ *       logical (lx, ly)  ==>  physical (ly, panel_h - 1 - lx)
+ *     - logical (0, 0)          -> physical (0, panel_h - 1)          -- bottom-left
+ *     - logical (logical_w-1,0) -> physical (0, 0)                    -- top-left
  *
  *   With logical_w == panel_h and logical_h == panel_w (typical for a
- *   90-degree rotation), both axes map 1:1.
+ *   90-degree rotation), both axes map 1:1 in either orientation.
  */
 
 #include "mini_gfx.h"
@@ -48,6 +50,7 @@ bool MiniGfx::beginSansPanel(int logical_w, int logical_h, int panel_w, int pane
             return false;
         }
         memset(_fb, 0, bytes);
+        _fb_owned = true;
     }
     return true;
 }
@@ -63,12 +66,42 @@ bool MiniGfx::begin(void *panel_handle,
     return true;
 }
 
+bool MiniGfx::beginExternalFb(void *panel_handle, void *external_fb,
+                              int logical_w, int logical_h,
+                              int panel_w,   int panel_h)
+{
+    if (!external_fb) {
+        ESP_LOGE(TAG, "beginExternalFb: external_fb is null");
+        return false;
+    }
+    _lw = logical_w;
+    _lh = logical_h;
+    _pw = panel_w;
+    _ph = panel_h;
+    _fb = static_cast<uint16_t *>(external_fb);
+    _fb_owned = false;
+    _panel = panel_handle;
+    /* Start from a known state so early reads see a clean canvas. */
+    const size_t n = static_cast<size_t>(_pw) * static_cast<size_t>(_ph);
+    for (size_t i = 0; i < n; ++i) _fb[i] = 0;
+    _dirty = true;
+    return true;
+}
+
 inline void MiniGfx::writeLogicalPixel(int lx, int ly, uint16_t color)
 {
     if (lx < 0 || lx >= _lw || ly < 0 || ly >= _lh) return;
-    const int px = _pw - 1 - ly;
-    const int py = lx;
+    int px, py;
+    if (_flip180) {
+        /* 180-degree flipped landscape: (lx, ly) -> (ly, _ph - 1 - lx). */
+        px = ly;
+        py = _ph - 1 - lx;
+    } else {
+        px = _pw - 1 - ly;
+        py = lx;
+    }
     _fb[py * _pw + px] = color;
+    _dirty = true;
 }
 
 void MiniGfx::fillLogicalRect(int lx, int ly, int lw, int lh, uint16_t color)
@@ -81,13 +114,23 @@ void MiniGfx::fillLogicalRect(int lx, int ly, int lw, int lh, uint16_t color)
     if (lw <= 0 || lh <= 0) return;
 
     /* In portrait memory, a logical rectangle (lx..lx+lw, ly..ly+lh) maps
-     * to physical columns [_pw-1-ly-lh+1 .. _pw-1-ly] and rows [lx .. lx+lw-1].
-     * It is faster to iterate in physical-row-major order because each
-     * physical row is contiguous memory.                                   */
-    int px0 = _pw - ly - lh;   /* inclusive */
-    int px1 = _pw - ly;        /* exclusive */
-    int py0 = lx;              /* inclusive */
-    int py1 = lx + lw;         /* exclusive */
+     * to physical columns/rows depending on which 90-degree rotation is
+     * active. The default (CW) mapping makes logical x increase downward
+     * in portrait; the flipped (CCW, 180-degree landscape) mapping makes
+     * logical x increase upward. Both iterate in physical-row-major order
+     * because each physical row is contiguous memory.                     */
+    int px0, px1, py0, py1;
+    if (_flip180) {
+        px0 = ly;                       /* inclusive */
+        px1 = ly + lh;                  /* exclusive */
+        py0 = _ph - (lx + lw);          /* inclusive */
+        py1 = _ph - lx;                 /* exclusive */
+    } else {
+        px0 = _pw - ly - lh;            /* inclusive */
+        px1 = _pw - ly;                 /* exclusive */
+        py0 = lx;                       /* inclusive */
+        py1 = lx + lw;                  /* exclusive */
+    }
 
     for (int py = py0; py < py1; ++py) {
         uint16_t *row = &_fb[py * _pw];
@@ -95,6 +138,7 @@ void MiniGfx::fillLogicalRect(int lx, int ly, int lw, int lh, uint16_t color)
             row[px] = color;
         }
     }
+    _dirty = true;
 }
 
 static inline uint16_t rgb565_of(uint32_t c)
@@ -112,6 +156,7 @@ void MiniGfx::fillScreen(uint32_t color)
     const size_t n = static_cast<size_t>(_pw) * static_cast<size_t>(_ph);
     uint16_t *p = _fb;
     for (size_t i = 0; i < n; ++i) p[i] = c;
+    _dirty = true;
 }
 
 void MiniGfx::fillRect(int x, int y, int w, int h, uint32_t color)
@@ -289,22 +334,34 @@ void MiniGfx::pushImage(int x, int y, int w, int h, const uint16_t *pixels)
             writeLogicalPixel(x + i, y + j, pixels[j * w + i]);
         }
     }
+    _dirty = true;
 }
 
 extern "C" void BoardDisplay_ClaimDmaSlot(void);
 
-void MiniGfx::flushAll(void)
+void MiniGfx::flushAllForce(void)
 {
     if (!_panel || !_fb) return;
     /* Wait for the previous MIPI-DSI framebuffer copy to finish before
      * starting a new one. Without this gate the driver prints
      *   "dpi_panel_draw_bitmap: previous draw operation is not finished"
-     * and the frame is dropped. The semaphore lives inside
-     * board_display_waveshare.cpp and is released by the DSI trans_done
-     * callback. */
+     * and the frame is dropped. The semaphore lives inside the board's
+     * display HAL and is released by the DSI trans_done callback. */
     BoardDisplay_ClaimDmaSlot();
     esp_lcd_panel_draw_bitmap(static_cast<esp_lcd_panel_handle_t>(_panel),
                               0, 0, _pw, _ph, _fb);
+    _dirty = false;
+}
+
+void MiniGfx::flushAll(void)
+{
+    /* Skip the DMA2D copy when nothing has been drawn since the last
+     * flush. The boot GUI's touch task calls BoardDisplay_Present()
+     * every 16 ms; without this guard we hammer the DPI panel with
+     * redundant full-frame writes, which on the Tab5 panel produces a
+     * visible black/content flicker. */
+    if (!_dirty) return;
+    flushAllForce();
 }
 
 void MiniGfx::flushRect(int /*x*/, int /*y*/, int /*w*/, int /*h*/)

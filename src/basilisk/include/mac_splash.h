@@ -52,4 +52,12 @@ void TransitionToEmulator();
  */
 void ShowErrorOverlay(const char *msg);
 
+/**
+ * @brief Paint the classic "It is now safe to switch off your computer"
+ *        screen: pure black fill with centered white Chicago. Called
+ *        after the emulator cleanly exits so the user isn't left with
+ *        the stale last Mac framebuffer.
+ */
+void ShowSafeToPowerOff();
+
 } // namespace MacSplash

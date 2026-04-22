@@ -23,7 +23,7 @@
 #include "board_display.h"
 #include "board_config.h"
 
-#include "mini_gfx.h"
+#include "mini_gfx/mini_gfx.h"
 
 #include <string.h>
 #include "esp_log.h"
@@ -117,7 +117,7 @@ extern "C" bool BoardDisplay_Init(void)
 
     /* Blank the panel on first show. */
     s_gfx.fillScreen(0x0000u);
-    s_gfx.flushAll();
+    s_gfx.flushAllForce();
 
     s_inited = true;
     ESP_LOGI(TAG, "Display up: logical %dx%d, panel %dx%d",
@@ -253,7 +253,7 @@ extern "C" void BoardDisplay_SetBacklight(int percent)
     bsp_display_brightness_set(percent);
 }
 
-MiniGfx &BoardDisplay_Gfx_Waveshare(void)
+MiniGfx &BoardDisplay_Gfx_Board(void)
 {
     return s_gfx;
 }

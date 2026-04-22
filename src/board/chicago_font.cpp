@@ -1,10 +1,9 @@
 /*
  * chicago_font.cpp - see chicago_font.h.
  *
- * Rendering is done exclusively through methods exposed by both M5GFX
- * (Tab5) and MiniGfx (Waveshare): fillRect. For transparent glyphs this is
- * the cheapest path - one fillRect per "on" pixel block - and keeps a
- * single compiled source for both backends.
+ * Rendering is done exclusively through MiniGfx::fillRect. For
+ * transparent glyphs this is the cheapest path - one fillRect per "on"
+ * pixel block - and keeps a single compiled source for both boards.
  */
 
 #include "chicago_font.h"
@@ -52,26 +51,23 @@ static int string_width_px(const char *s)
 /* Public font API                                                            */
 /* ------------------------------------------------------------------------- */
 
-int Chicago_MeasureWidth(const char *s, int scale)
+int Chicago_MeasureWidth(const char *s)
 {
-    if (scale < 1) scale = 1;
-    return string_width_px(s) * scale;
+    return string_width_px(s);
 }
 
-int Chicago_LineHeight(int scale)
+int Chicago_LineHeight(void)
 {
-    if (scale < 1) scale = 1;
-    return CHICAGO_LINE_HEIGHT * scale;
+    return CHICAGO_LINE_HEIGHT;
 }
 
 void Chicago_DrawString(const char *s, int x, int y, uint16_t fg,
-                        uint8_t datum, int scale)
+                        uint8_t datum)
 {
     if (!s || !*s) return;
-    if (scale < 1) scale = 1;
 
-    int width_px  = string_width_px(s) * scale;
-    int height_px = (CHICAGO_ASCENT + CHICAGO_DESCENT) * scale;
+    int width_px  = string_width_px(s);
+    int height_px = CHICAGO_ASCENT + CHICAGO_DESCENT;
 
     /* Convert (x, y) + datum into a top-left pen position. The pen itself
      * sits on the baseline, so we keep a separate baseline_y. */
@@ -94,28 +90,28 @@ void Chicago_DrawString(const char *s, int x, int y, uint16_t fg,
         default:                                                    break;
     }
 
-    int baseline_y = top_left_y + CHICAGO_ASCENT * scale;
+    int baseline_y = top_left_y + CHICAGO_ASCENT;
     int pen_x      = top_left_x;
 
     auto &gfx = BoardDisplay_Gfx();
 
     for (const char *p = s; *p; ++p) {
         const ChicagoGlyph *g = glyph_for(*p);
-        /* Glyph bitmap sits at: left = pen_x + bbx_x*scale,
-         *                      bottom = baseline_y - bbx_y*scale. */
-        int glyph_left   = pen_x + g->bbx_x * scale;
-        int glyph_bottom = baseline_y - g->bbx_y * scale;
-        int glyph_top    = glyph_bottom - g->h * scale;
+        /* Glyph bitmap sits at: left = pen_x + bbx_x,
+         *                      bottom = baseline_y - bbx_y. */
+        int glyph_left   = pen_x + g->bbx_x;
+        int glyph_bottom = baseline_y - g->bbx_y;
+        int glyph_top    = glyph_bottom - g->h;
         for (int gy = 0; gy < g->h; ++gy) {
             for (int gx = 0; gx < g->w; ++gx) {
                 if (glyph_bit(g, gx, gy)) {
-                    gfx.fillRect(glyph_left + gx * scale,
-                                 glyph_top  + gy * scale,
-                                 scale, scale, fg);
+                    gfx.fillRect(glyph_left + gx,
+                                 glyph_top  + gy,
+                                 1, 1, fg);
                 }
             }
         }
-        pen_x += g->advance * scale;
+        pen_x += g->advance;
     }
 }
 

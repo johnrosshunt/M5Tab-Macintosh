@@ -98,11 +98,27 @@ def _download_if_missing(url: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size >= _MIN_PLAUSIBLE_SIZE:
         return
+    # Espressif only keeps the latest slave firmware on their GitHub Pages
+    # mirror, so older header-reported versions 404. If the directly
+    # requested URL is gone but another esp32c6-v*.bin is sitting in the
+    # same destination directory (cached from a previous build against a
+    # newer arduino-esp32 libs pack), reuse that - the host side of
+    # esp-hosted 2.x is backward compatible across minor/patch versions.
     print(f"[C6 FW] Downloading {url} -> {dest}")
     try:
         with urllib.request.urlopen(url, timeout=60) as resp:
             data = resp.read()
     except urllib.error.URLError as exc:
+        cached = sorted(dest.parent.glob("esp32c6-v*.bin"))
+        cached = [p for p in cached if p.is_file() and p.stat().st_size >= _MIN_PLAUSIBLE_SIZE]
+        if cached:
+            src = cached[-1]
+            print(
+                f"[C6 FW] Upstream URL {url} unavailable ({exc}); "
+                f"falling back to cached {src.name}"
+            )
+            dest.write_bytes(src.read_bytes())
+            return
         raise RuntimeError(
             f"Failed to download ESP32-C6 firmware from {url}: {exc}. "
             "Check internet connectivity, or pre-populate the file manually."

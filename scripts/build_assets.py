@@ -88,7 +88,8 @@ def _first_existing(directory, basenames):
 
 
 SRC_BG_TILE   = _first_existing(ASSETS_DIR, ["BgTile.png", "bgtile.png"])
-SRC_HAPPY_MAC = _first_existing(ASSETS_DIR, ["happymacicon.png", "happymacIcon.png",
+SRC_HAPPY_MAC = _first_existing(ASSETS_DIR, ["happymacIconNew.png", "happymacicon.png",
+                                              "happymacIcon.png",
                                               "HappyMacIcon.png", "happyMacIcon.png"])
 SRC_FONT_TTF  = _first_existing(FONTS_DIR,  ["pixChicago.ttf", "pixchicago.ttf",
                                               "PixChicago.ttf", "chicago.ttf",

@@ -41,8 +41,11 @@ int happy_mac_mask_row_bytes()
 
 void paint_splash()
 {
-    auto &gfx = BoardDisplay_Gfx();
-    gfx.fillScreen(kBlack);
+    /* No explicit fillScreen: Gfx_TileBackground paints the entire
+     * screen with the desktop stipple (it iterates x=0..screen_w,
+     * y=0..screen_h), so a prior black fill is pure waste and, with
+     * the Tab5's externally-mapped DPI framebuffer, shows up as a
+     * visible black flash before the checkerboard draws in.          */
     Gfx_TileBackground(BG_TILE_PIXELS, BG_TILE_W, BG_TILE_H, /*scale=*/2);
     Gfx_DrawIconCentered(HAPPY_MAC_PIXELS, HAPPY_MAC_W, HAPPY_MAC_H,
                          happy_mac_mask_ptr(), happy_mac_mask_row_bytes(),
@@ -70,6 +73,16 @@ namespace MacSplash {
 
 void Begin()
 {
+    /* Paint the splash FIRST so the 1-second touch-warmup delay below
+     * happens while the user is looking at the Happy Mac, not at a
+     * plain black screen. Previously this order was reversed and that
+     * produced a visible two-step transition (black -> splash). The
+     * warmup only needs Board_Update() to pump the touch controller;
+     * it does not depend on the display state.                        */
+    Serial.printf("[MAC_SPLASH] Painting splash (%dx%d)\n",
+                  BoardDisplay_Width(), BoardDisplay_Height());
+    paint_splash();
+
     /* Warm up the touch panel before starting the polling task.
      * Capacitive controllers typically need a handful of update cycles
      * after boot before their first report is meaningful. */
@@ -82,10 +95,6 @@ void Begin()
     if (!BootGUI_StartTouchTask()) {
         Serial.println("[MAC_SPLASH] WARNING: failed to start touch task");
     }
-
-    Serial.printf("[MAC_SPLASH] Painting splash (%dx%d)\n",
-                  BoardDisplay_Width(), BoardDisplay_Height());
-    paint_splash();
 }
 
 bool WaitForTapOrTimeout(uint32_t ms)
@@ -138,9 +147,12 @@ void ShowErrorOverlay(const char *msg)
      * splash, so the error is clearly different from the boot state. */
     gfx.fillScreen(0x4208);  /* ~25% gray */
 
-    /* Centered panel with a white Chicago error message. */
+    /* Centered panel with a white Chicago error message. Chicago renders
+     * at its native 23-px pixel-perfect size; we stack lines at
+     * line-height intervals instead of scaling up. */
+    int line_h  = Chicago_LineHeight();
     int panel_w = screen_w * 3 / 4;
-    int panel_h = Chicago_LineHeight(/*scale=*/3) * 5;
+    int panel_h = line_h * 6;
     int panel_x = (screen_w - panel_w) / 2;
     int panel_y = (screen_h - panel_h) / 2;
 
@@ -154,14 +166,29 @@ void ShowErrorOverlay(const char *msg)
     Chicago_DrawString("ERROR",
                        screen_w / 2, header_y,
                        kWhite,
-                       /*datum=*/MC_DATUM,
-                       /*scale=*/4);
+                       /*datum=*/MC_DATUM);
     Chicago_DrawString(msg,
                        screen_w / 2, msg_y,
                        kWhite,
-                       /*datum=*/MC_DATUM,
-                       /*scale=*/2);
+                       /*datum=*/MC_DATUM);
 
+    BoardDisplay_Present();
+}
+
+void ShowSafeToPowerOff()
+{
+    auto &gfx = BoardDisplay_Gfx();
+    int screen_w = BoardDisplay_Width();
+    int screen_h = BoardDisplay_Height();
+    int cx = screen_w / 2;
+    int cy = screen_h / 2;
+    int lh = Chicago_LineHeight();
+
+    gfx.fillScreen(kBlack);
+    Chicago_DrawString("It is now safe to switch off",
+                       cx, cy - lh, kWhite, MC_DATUM);
+    Chicago_DrawString("your Macintosh.",
+                       cx, cy + 4, kWhite, MC_DATUM);
     BoardDisplay_Present();
 }
 

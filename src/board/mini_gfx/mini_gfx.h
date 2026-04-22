@@ -47,6 +47,29 @@ public:
     bool beginSansPanel(int logical_w, int logical_h,
                         int panel_w,   int panel_h);
 
+    /* Attach to an esp_lcd_panel using an externally-provided
+     * framebuffer pointer. The pointer MUST be one of the DPI panel's
+     * own internal framebuffers (obtained via
+     * esp_lcd_dpi_panel_get_frame_buffer). This lets flushAll take the
+     * "source buffer already lives in a panel FB" fast path inside
+     * esp_lcd_panel_draw_bitmap, which performs only a cache writeback
+     * (no PSRAM->PSRAM DMA2D copy). Avoiding that copy prevents
+     * MIPI-DSI bridge underruns that otherwise flash the panel to
+     * black during repeated full-frame flushes. */
+    bool beginExternalFb(void *panel_handle, void *external_fb,
+                         int  logical_w, int  logical_h,
+                         int  panel_w,   int  panel_h);
+
+    /* Flip the landscape view 180 degrees. Default is off, matching the
+     * 90-degree CW mapping (lx, ly) -> (_pw - 1 - ly, lx) used on boards
+     * whose panel ribbon exits at the bottom of the landscape view. When
+     * enabled the mapping becomes (lx, ly) -> (ly, _ph - 1 - lx) which
+     * is equivalent to rotating the rendered landscape output 180
+     * degrees. Call before any draws; toggling at runtime does not
+     * re-render already-drawn pixels. */
+    void setFlip180(bool on) { _flip180 = on; }
+    bool flip180(void) const { return _flip180; }
+
     /* LovyanGFX-compatible drawing API (subset used by boot_gui.cpp). */
     int  width(void)  const { return _lw; }
     int  height(void) const { return _lh; }
@@ -73,8 +96,12 @@ public:
      * framebuffer. No rotation is applied - pixels are laid out landscape. */
     void pushImage(int x, int y, int w, int h, const uint16_t *pixels);
 
-    /* Panel push */
+    /* Panel push. flushAll is a no-op when nothing has been drawn
+     * since the last flush; use flushAllForce to unconditionally re-
+     * push the current framebuffer (used by the initial bring-up
+     * clear). */
     void flushAll(void);
+    void flushAllForce(void);
     void flushRect(int x, int y, int w, int h);
 
     /* Raw framebuffer (portrait orientation, size panel_w * panel_h). */
@@ -85,10 +112,14 @@ public:
 private:
     void *   _panel        = nullptr;  /* esp_lcd_panel_handle_t - opaque to avoid header dep */
     uint16_t *_fb          = nullptr;  /* RGB565, portrait, _pw x _ph */
+    bool     _fb_owned     = false;    /* true if we allocated _fb (must free); false for external FB */
     int      _lw           = 0;        /* logical landscape width  */
     int      _lh           = 0;        /* logical landscape height */
     int      _pw           = 0;        /* panel portrait width     */
     int      _ph           = 0;        /* panel portrait height    */
+    bool     _flip180      = false;    /* rotate landscape view 180 degrees */
+
+    bool     _dirty        = false;   /* any draw op sets this; flushAll clears it */
 
     uint32_t _text_color   = 0xFFFFu;  /* white  */
     uint32_t _text_bg      = 0x0000u;  /* black  */

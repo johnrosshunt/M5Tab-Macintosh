@@ -14,10 +14,16 @@
  *
  * Platform notes:
  *   - Waveshare (ARDUINO_USB_MODE=0): USB-OTG is otherwise idle during
- *     pre-boot; USB.begin() enumerates us as an MSC-only device.
- *   - Tab5 (ARDUINO_USB_MODE=1): the port is HWCDC/upload at boot, not
- *     USB-OTG, so Arduino's USBMSC isn't available. UsbMsc_IsSupported()
- *     returns false and the boot GUI hides the button.
+ *     pre-boot; USB.begin() enumerates us as an MSC-only device. Done
+ *     detaches the MSC class cleanly and returns to the boot menu.
+ *   - Tab5 (ARDUINO_USB_MODE=1): the USB-C port is normally wired to
+ *     the ESP32-P4's USB-SERIAL-JTAG peripheral (HWCDC console +
+ *     flashing). The ESP32-P4 USB-D+/D- pins can be multiplexed to
+ *     either USB-SERIAL-JTAG or USB-OTG, so at runtime we can call
+ *     Serial.end() to release HWCDC, then USB.begin() to route the
+ *     pins to TinyUSB/OTG and expose the SD card as a disk. This
+ *     permanently kills the serial console for the session, so we
+ *     ESP.restart() on exit to cleanly restore HWCDC for the next boot.
  */
 
 #include <Arduino.h>
@@ -27,10 +33,11 @@
 
 #include "sdkconfig.h"
 
-// Arduino USBMSC is only compiled in OTG mode + when MSC is enabled via
-// the Kconfig option we set in sdkconfig.{tab5,waveshare}.
-#if defined(SOC_USB_OTG_SUPPORTED) && CONFIG_TINYUSB_MSC_ENABLED && \
-    !ARDUINO_USB_MODE
+// Arduino's USBMSC class is compiled in the core whenever the SoC has a
+// USB-OTG peripheral and TinyUSB MSC is enabled via sdkconfig. We don't
+// need !ARDUINO_USB_MODE at compile time anymore - on Tab5 we switch the
+// PHY at runtime (see UsbMsc_Enter below).
+#if defined(SOC_USB_OTG_SUPPORTED) && CONFIG_TINYUSB_MSC_ENABLED
 #define USB_MSC_AVAILABLE 1
 #else
 #define USB_MSC_AVAILABLE 0
@@ -142,6 +149,18 @@ extern "C" bool UsbMsc_Enter(const char **out_error_msg)
     Serial.printf("[USB_MSC] SD geometry: %u sectors x %u bytes\n",
                   (unsigned)n_sec, (unsigned)sec_size);
 
+#if ARDUINO_USB_MODE
+    // Tab5 path: the USB-C port is currently wired to USB-SERIAL-JTAG
+    // (HWCDC). Tell the user over serial that it's about to disappear,
+    // flush, then release HWCDC so the PHY mux is free for USB-OTG.
+    Serial.println("[USB_MSC] Tab5: releasing HWCDC so USB-OTG can take over.");
+    Serial.println("[USB_MSC] Serial console will go silent until the");
+    Serial.println("[USB_MSC] device reboots when the user taps Done.");
+    Serial.flush();
+    delay(50);
+    Serial.end();
+#endif
+
     s_msc.vendorID("M5Tab");
     s_msc.productID("Macintosh-SD");
     s_msc.productRevision("1.0");
@@ -170,21 +189,29 @@ extern "C" bool UsbMsc_Enter(const char **out_error_msg)
         s_usb_started = true;
     }
 
-    Serial.println("[USB_MSC] MSC device running - waiting for exit...");
-
     // Park until the boot GUI asks us to leave. The host OS sees the
     // microSD as a normal USB drive in the meantime.
     while (!s_exit_requested) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    Serial.println("[USB_MSC] Exit requested, detaching MSC...");
-
-    // Detach the MSC class. Arduino's USB stays begun - USB.end() isn't
-    // exposed. That's fine: when MSC is gone the host sees the disk
-    // disappear and we stop responding to sector reads until the next
-    // UsbMsc_Enter(). No re-mount of SD is needed because we never
-    // unmounted it in the first place.
+#if ARDUINO_USB_MODE
+    // Tab5: TinyUSB/OTG owns the PHY mux now. The cleanest way to get
+    // HWCDC back (for the next upload/serial session) is a full reboot -
+    // the bootloader re-selects USB-SERIAL-JTAG automatically.
+    s_msc.mediaPresent(false);
+    s_msc.end();
+    s_msc_up       = false;
+    s_host_mounted = false;
+    // Tiny pause so the host sees the ejection before we disappear.
+    delay(250);
+    ESP.restart();
+    // not reached
+    return true;
+#else
+    // Waveshare: detach the MSC class and return. USB stays begun
+    // because Arduino doesn't expose USB.end(); next UsbMsc_Enter() will
+    // just re-attach MSC and the host will see the disk reappear.
     s_msc.mediaPresent(false);
     s_msc.end();
     s_msc_up        = false;
@@ -192,6 +219,7 @@ extern "C" bool UsbMsc_Enter(const char **out_error_msg)
 
     Serial.println("[USB_MSC] USB Disk mode exited cleanly");
     return true;
+#endif
 }
 
 extern "C" void UsbMsc_RequestExit(void)

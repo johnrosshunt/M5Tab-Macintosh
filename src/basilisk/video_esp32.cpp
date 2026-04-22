@@ -1,5 +1,5 @@
 /*
- *  video_esp32.cpp - Video/graphics emulation for ESP32-P4 with M5GFX
+ *  video_esp32.cpp - Video/graphics emulation for ESP32-P4
  *
  *  BasiliskII ESP32 Port
  *
@@ -34,11 +34,6 @@
 
 #include "board_config.h"
 #include "board_display.h"
-
-#if defined(BOARD_M5STACK_TAB5)
-#include <M5Unified.h>
-#include <M5GFX.h>
-#endif
 
 // FreeRTOS for dual-core support
 #include "freertos/FreeRTOS.h"
@@ -171,7 +166,7 @@ static volatile uint32 preserve_splash_armed_ms = 0;
 #define STRIP_BUF_PIXELS (DISPLAY_WIDTH * TILE_HEIGHT * PIXEL_SCALE)
 static uint16 *strip_buffer = nullptr;
 
-// Display dimensions (from M5.Display)
+// Display dimensions (from BoardDisplay HAL)
 static int display_width = 0;
 static int display_height = 0;
 
@@ -213,27 +208,15 @@ public:
 static ESP32_monitor_desc *the_monitor = NULL;
 
 /*
- *  Convert RGB888 to the RGB565 layout expected by the board's display stack.
- *
- *  - Tab5 (M5GFX): byte-swapped RGB565 (swap565_t). M5GFX's writePixelsDMA
- *    reads two bytes per pixel in this exact order; returning native RGB565
- *    produces a green/blue/red swap on the Tab5 panel.
- *  - Waveshare (esp_lcd_panel_draw_bitmap): native little-endian RGB565
- *    (standard R:5 G:6 B:5 packing). Returning the swap565 value here
- *    produces a greenish cast.
+ *  Convert RGB888 to the native little-endian RGB565 layout that
+ *  esp_lcd_panel_draw_bitmap() expects (R:5 G:6 B:5 packing). Both
+ *  boards now drive their MIPI-DSI panels through the same IDF API,
+ *  so a single conversion works everywhere.
  */
-#if defined(BOARD_WAVESHARE_P4_101)
 static inline uint16 rgb888_to_rgb565(uint8 r, uint8 g, uint8 b)
 {
     return (uint16)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
 }
-#else
-static inline uint16 rgb888_to_rgb565(uint8 r, uint8 g, uint8 b)
-{
-    // swap565 format: matches M5GFX's internal swap565() function
-    return ((r >> 3) << 3 | (g >> 5)) | (((g >> 2) << 5 | (b >> 3)) << 8);
-}
-#endif
 
 /*
  *  Set palette for indexed color modes
