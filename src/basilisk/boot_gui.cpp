@@ -3016,15 +3016,40 @@ static void runUsbMscScreen(void)
     drawDesktopPattern();
     drawMenuBar("USB Disk Mode");
 
+    int line_h = Chicago_LineHeight() + 4;
+
+    // Vertical layout constants. The panel auto-sizes to its content so
+    // boards with extra instructional copy (Tab5's USB-A cable note) grow
+    // the window instead of tucking text under the Done button.
+    const int top_pad    = 30;
+    const int bottom_pad = 20;
+    const int text_gap   = line_h;  // breathing room between text and status
+    const int status_row = 30;
+    const int btn_gap    = 20;
+    const int btn_w      = 160;
+    const int btn_h      = 60;
+
+    // Text block: each paragraph is N lines; paragraphs are separated by
+    // a line_h gap. Intro + action are universal; Tab5 adds a cable hint.
+    int intro_lines  = 2;  // "Your SD card is now available..." / "...USB drive."
+    int action_lines = 2;  // "Copy or remove disk images..." / "...boot menu."
+    int note_lines   = 0;
+#if defined(BOARD_M5STACK_TAB5)
+    note_lines = 2;        // "Use a USB-A to USB-C cable..." / "...not USB-C."
+#endif
+    int n_paragraphs = 2 + (note_lines > 0 ? 1 : 0);
+    int total_lines  = intro_lines + action_lines + note_lines;
+    int text_block_h = total_lines * line_h + (n_paragraphs - 1) * line_h;
+
     int panel_w = SCREEN_WIDTH * 3 / 5;
-    int panel_h = 340;
+    int panel_h = TITLE_BAR_HEIGHT + top_pad + text_block_h
+                + text_gap + status_row + btn_gap + btn_h + bottom_pad;
     int panel_x = (SCREEN_WIDTH - panel_w) / 2;
     int panel_y = (SCREEN_HEIGHT - panel_h) / 2;
     drawWindow(panel_x, panel_y, panel_w, panel_h, "USB Disk");
 
     int text_x = panel_x + 30;
-    int text_y = panel_y + TITLE_BAR_HEIGHT + 30;
-    int line_h = Chicago_LineHeight() + 4;
+    int text_y = panel_y + TITLE_BAR_HEIGHT + top_pad;
 
     Chicago_DrawString("Your SD card is now available on your",
                        text_x, text_y, MAC_BLACK, TL_DATUM);
@@ -3038,28 +3063,22 @@ static void runUsbMscScreen(void)
     text_y += line_h;
     Chicago_DrawString("\"Done\" to return to the boot menu.",
                        text_x, text_y, MAC_BLACK, TL_DATUM);
-    text_y += line_h * 2;
 
 #if defined(BOARD_M5STACK_TAB5)
-    Chicago_DrawString("Note: serial logging and firmware upload",
+    text_y += line_h * 2;
+    Chicago_DrawString("Use a USB-A to USB-C cable, and plug the",
                        text_x, text_y, MAC_DARK_GRAY, TL_DATUM);
     text_y += line_h;
-    Chicago_DrawString("are disabled while this is active. The",
+    Chicago_DrawString("USB-A end into the USB-A port (not USB-C).",
                        text_x, text_y, MAC_DARK_GRAY, TL_DATUM);
-    text_y += line_h;
-    Chicago_DrawString("device will reboot when you tap Done.",
-                       text_x, text_y, MAC_DARK_GRAY, TL_DATUM);
-    text_y += line_h;
 #endif
 
-    // "Done" button at panel bottom.
-    int btn_w = 160;
-    int btn_h = 60;
+    // "Done" button at panel bottom, status row just above it.
     int btn_x = panel_x + (panel_w - btn_w) / 2;
-    int btn_y = panel_y + panel_h - btn_h - 20;
+    int btn_y = panel_y + panel_h - btn_h - bottom_pad;
 
-    // Status area just above the button: host mount state, error if any.
-    int status_y = btn_y - 30;
+    // Status area: host mount state, error if any.
+    int status_y = btn_y - btn_gap - (status_row / 2);
     auto redrawStatus = [&](bool host_mounted, const char *error) {
         // Status sits inside the window's white body, so just wipe
         // with white before re-rendering the line.

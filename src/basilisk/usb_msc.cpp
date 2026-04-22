@@ -16,14 +16,19 @@
  *   - Waveshare (ARDUINO_USB_MODE=0): USB-OTG is otherwise idle during
  *     pre-boot; USB.begin() enumerates us as an MSC-only device. Done
  *     detaches the MSC class cleanly and returns to the boot menu.
- *   - Tab5 (ARDUINO_USB_MODE=1): the USB-C port is normally wired to
- *     the ESP32-P4's USB-SERIAL-JTAG peripheral (HWCDC console +
- *     flashing). The ESP32-P4 USB-D+/D- pins can be multiplexed to
- *     either USB-SERIAL-JTAG or USB-OTG, so at runtime we can call
- *     Serial.end() to release HWCDC, then USB.begin() to route the
- *     pins to TinyUSB/OTG and expose the SD card as a disk. This
- *     permanently kills the serial console for the session, so we
- *     ESP.restart() on exit to cleanly restore HWCDC for the next boot.
+ *   - Tab5 (BOARD_M5STACK_TAB5): Tab5's USB-C jack is hard-wired to the
+ *     ESP32-P4 USB-Serial-JTAG controller (FS_PHY1) - there is no way
+ *     to surface TinyUSB MSC on it without burning EFUSE_USB_PHY_SEL.
+ *     The USB-A jack, however, is wired to USB-OTG HS (HS_PHY, GPIO
+ *     49/50), which is exactly where Arduino-ESP32's USB.begin() lands.
+ *     So we run MSC over USB-A with a USB-A-to-USB-C cable. Tab5's own
+ *     5V output to the USB-A port is gated through the PI4IOE #1 pin 3
+ *     load switch; we turn it off (M5.Power.setExtOutput(false, ext_USB))
+ *     so the attached host can supply VBUS, then re-enable it on exit.
+ *     HWCDC/Serial lives on USB-Serial-JTAG - a different hardware
+ *     controller - so it stays up the whole time. We still ESP.restart()
+ *     on exit because Arduino-ESP32 doesn't expose USB.end()/usb_del_phy,
+ *     and the emulator's esp_usb_host needs a clean PHY to claim.
  */
 
 #include <Arduino.h>
@@ -33,10 +38,14 @@
 
 #include "sdkconfig.h"
 
+#if defined(BOARD_M5STACK_TAB5)
+#include <M5Unified.h>
+#endif
+
 // Arduino's USBMSC class is compiled in the core whenever the SoC has a
-// USB-OTG peripheral and TinyUSB MSC is enabled via sdkconfig. We don't
-// need !ARDUINO_USB_MODE at compile time anymore - on Tab5 we switch the
-// PHY at runtime (see UsbMsc_Enter below).
+// USB-OTG peripheral and TinyUSB MSC is enabled via sdkconfig. On both
+// Tab5 and Waveshare we hit this branch; per-board behaviour is gated at
+// runtime inside UsbMsc_Enter (see BOARD_M5STACK_TAB5 sections).
 #if defined(SOC_USB_OTG_SUPPORTED) && CONFIG_TINYUSB_MSC_ENABLED
 #define USB_MSC_AVAILABLE 1
 #else
@@ -149,16 +158,13 @@ extern "C" bool UsbMsc_Enter(const char **out_error_msg)
     Serial.printf("[USB_MSC] SD geometry: %u sectors x %u bytes\n",
                   (unsigned)n_sec, (unsigned)sec_size);
 
-#if ARDUINO_USB_MODE
-    // Tab5 path: the USB-C port is currently wired to USB-SERIAL-JTAG
-    // (HWCDC). Tell the user over serial that it's about to disappear,
-    // flush, then release HWCDC so the PHY mux is free for USB-OTG.
-    Serial.println("[USB_MSC] Tab5: releasing HWCDC so USB-OTG can take over.");
-    Serial.println("[USB_MSC] Serial console will go silent until the");
-    Serial.println("[USB_MSC] device reboots when the user taps Done.");
-    Serial.flush();
-    delay(50);
-    Serial.end();
+#if defined(BOARD_M5STACK_TAB5)
+    // Tab5 path: USB-A jack is wired to OTG-HS (where USB.begin() lands).
+    // Turn off Tab5's own 5V output to the USB-A load switch so the
+    // attached host can supply VBUS. HWCDC/Serial is on a separate
+    // USB-Serial-JTAG PHY and keeps running throughout.
+    Serial.println("[USB_MSC] Tab5: gating USB-A 5V so host can supply VBUS.");
+    M5.Power.setExtOutput(false, m5::ext_port_mask_t::ext_USB);
 #endif
 
     s_msc.vendorID("M5Tab");
@@ -195,16 +201,21 @@ extern "C" bool UsbMsc_Enter(const char **out_error_msg)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-#if ARDUINO_USB_MODE
-    // Tab5: TinyUSB/OTG owns the PHY mux now. The cleanest way to get
-    // HWCDC back (for the next upload/serial session) is a full reboot -
-    // the bootloader re-selects USB-SERIAL-JTAG automatically.
+#if defined(BOARD_M5STACK_TAB5)
+    // Tab5: eject, then reboot. Arduino-ESP32 doesn't expose USB.end()
+    // or usb_del_phy, and esp_usb_host (used by input_esp32.cpp for
+    // keyboards) needs an unclaimed PHY. Restart is the cleanest fix.
     s_msc.mediaPresent(false);
     s_msc.end();
     s_msc_up       = false;
     s_host_mounted = false;
     // Tiny pause so the host sees the ejection before we disappear.
     delay(250);
+    // Restore USB-A 5V output so keyboards/mice work after reboot.
+    M5.Power.setExtOutput(true, m5::ext_port_mask_t::ext_USB);
+    Serial.println("[USB_MSC] USB Disk mode exited; restarting to release PHY.");
+    Serial.flush();
+    delay(50);
     ESP.restart();
     // not reached
     return true;
@@ -234,10 +245,10 @@ extern "C" bool UsbMsc_HostMounted(void)
 
 #else  /* USB_MSC_AVAILABLE */
 
-// This build target doesn't have USBMSC available (Tab5 in HWCDC mode,
-// or TinyUSB MSC not enabled in sdkconfig). Stub out the entry points
-// so the module still links; the boot GUI checks UsbMsc_IsSupported()
-// and hides the button when false.
+// This build target doesn't have USBMSC available (TinyUSB MSC not
+// enabled in sdkconfig, or SoC without USB-OTG). Stub out the entry
+// points so the module still links; the boot GUI checks
+// UsbMsc_IsSupported() and hides the button when false.
 
 extern "C" bool UsbMsc_IsSupported(void)           { return false; }
 extern "C" bool UsbMsc_HostMounted(void)           { return false; }
