@@ -17,10 +17,10 @@ Both variants share the BasiliskII core, video pipeline, USB HID handling, and b
 ## Screenshots
 
 <p align="center">
-  <img src="screenshots/Toasters2.5.gif" alt="Flying Toasters v2.5"/>
+  <img src="screenshots/BetterToasters.gif" alt="Flying Toasters v4.0"/>
 </p>
 
-*Flying Toasters running smoothly with write-time dirty tracking and tile-based rendering*
+*Flying Toasters running smoothly with write-time dirty tracking and tile-based rendering — the three-finger on-screen keyboard lives one gesture away*
 
 <p align="center">
   <img src="screenshots/MacOS8.1_Booted.jpeg" width="45%" alt="Mac OS 8.1 Desktop"/>
@@ -46,37 +46,55 @@ Both variants share the BasiliskII core, video pipeline, USB HID handling, and b
 
 ---
 
-## What's New in v3.4
+## What's New in v4.0
 
-- **Shared folder (ExtFS)** — pick a folder on your SD card in the pre-boot
-  menu and it appears as a mounted volume inside Mac OS, named after the
-  folder (e.g. `/Shared` becomes a `Shared` disk on the desktop). Lets
-  you drop disk images, docs, or installers onto the SD card from your
-  host and have them show up live in the emulator without re-imaging the
-  hard disk. Finder info and resource forks are preserved via `.finf/`
-  and `.rsrc/` sidecar directories on the FAT/exFAT SD card.
-- **USB Disk mode** — a new button on the pre-boot settings screen
-  exposes the SD card over USB Mass Storage, so you can copy files to/
-  from the card without removing it from the device (Tab5).
-- **Baked-in ESP32-C6 WiFi firmware** (Waveshare) — the matching
-  co-processor firmware is now embedded in the host firmware and
-  auto-flashed over SDIO hosted OTA on first boot if the slave is out
-  of date. No internet, no manual recovery, no chicken-and-egg when
-  WiFi itself is broken. A "Updating WiFi" splash shows during the
-  ~30 s update, then the host reboots into working WiFi.
-- **Cleaner splash → Mac OS handoff** — the pre-boot splash stays on
-  the panel until the 68k actually starts writing to the framebuffer,
-  so there's no gray flash between the Happy Mac and the Welcome
-  banner.
-- **Fewer SD writes during emulation** — XPRAM (PRAM) now shadows the
-  last-written copy and only hits the SD card when it actually
-  changes, which both speeds up idle-loop startup and reduces wear.
-- **Fix: outdated C6 firmware no longer bricks SD access.** The old
-  WiFi teardown path used to deinit the shared `esp_driver_sdmmc` host
-  context; we now leave it up so the microSD and the C6 radio can
-  coexist safely.
-- **Fix: ExtFS + WiFi volumes now have readable names** in the Mac
-  Finder (the upstream `GetString()` stub was returning empty strings).
+- **Multi-touch on-screen keyboard** — three-finger tap anywhere on the
+  Mac screen spawns a full QWERTY overlay with sticky Shift / Ctrl /
+  Option / Command modifiers and an arrow cluster. Typing drives real
+  ADB keystrokes, so it works in any Mac application — Finder, SimpleText,
+  HyperCard, Netscape, the works. Three-finger tap again to dismiss.
+- **Gaming overlay** — four-finger tap spawns a D-pad plus
+  Esc / Return / Space / Option action cluster for arrow-key games
+  (Glider, Crystal Quest, Marathon, etc.). Four-finger tap dismisses;
+  a three-finger tap while the gaming overlay is up swaps straight
+  over to the keyboard.
+- **"Transparent" overlay without alpha math** — because every Mac
+  pixel is already pixel-doubled to a 2x2 physical block, the compositor
+  writes only the `(even, even)` sub-pixel of each block, giving exact
+  25% coverage so the Mac content shows through the other three
+  sub-pixels for free. Held keys overlay a 50% checker of black for a
+  pressed look; latched modifiers use the opposite checker so you can
+  tell at a glance which Shift state is active.
+- **Per-board PlatformIO pinning** — the Tab5 and Waveshare now lock
+  to different pioarduino releases because each adjacent release breaks
+  the other board. Tab5 stays on `55.03.35` (IDF 5.5.1) to avoid a
+  MIPI-DSI backlight flicker that hit M5GFX in IDF 5.5.2; Waveshare
+  moves to `55.03.38-1` (IDF 5.5.4) to pick up the newer `esp_hosted`
+  that no longer panics in `sdio_rx_get_buffer` under sustained SD I/O.
+- **Tab5 USB Disk over USB-A** — SD-card-over-USB-MSC now routes through
+  the Tab5's USB-A port (OTG-HS, where TinyUSB actually lands on the
+  ESP32-P4) instead of USB-C. HWCDC stays alive throughout, so the
+  serial console keeps working while the card is mounted on your host.
+  Plug a standard USB-A-to-USB-C cable into the Tab5 USB-A jack and
+  the other end into your computer; Tab5's own 5V output is gated off
+  so the host supplies VBUS.
+- **Auto-sized USB Disk dialog** — the pre-boot MSC dialog now grows
+  to fit its copy so the Tab5 cable instructions no longer run under
+  the Done button.
+- **Carry-forward from the 3.4.x line** — 180° Tab5 rotation,
+  single-refresh boot splash, shared folder (ExtFS), baked-in ESP32-C6
+  WiFi firmware with SDIO hosted OTA, XPRAM write coalescing, and the
+  pre-boot-to-Mac-OS handoff with no gray flash.
+
+<p align="center">
+  <img src="screenshots/v4-M5Keyboard.jpeg" width="45%" alt="On-screen keyboard overlay on the M5Stack Tab5"/>
+  <img src="screenshots/v4-M5Gamemode.jpeg" width="45%" alt="Gaming D-pad overlay on the M5Stack Tab5"/>
+</p>
+
+<p align="center">
+  <img src="screenshots/v4-WaveshareBootKeyboard.jpeg" width="45%" alt="On-screen keyboard overlay on the Waveshare P4 10.1"/>
+  <img src="screenshots/v4-Preboot.jpeg" width="45%" alt="Pre-boot configuration environment"/>
+</p>
 
 ---
 
@@ -343,7 +361,7 @@ esptool.py --chip esp32p4 \
     --port /dev/ttyACM0 \
     --baud 921600 \
     write_flash \
-    0x0 M5Tab-Macintosh-v3.4.bin
+    0x0 M5Tab-Macintosh-v4.0.bin
 ```
 
 **Note**: Replace `/dev/ttyACM0` with your actual port:
@@ -382,58 +400,61 @@ For versioned releases, use the release script:
 
 ```bash
 # Create versioned release binaries for both boards
-./scripts/build_release.sh v3.4
+./scripts/build_release.sh v4.0
 
 # Output:
-#   release/M5Tab-Macintosh-v3.4.bin
-#   release/M5Tab-Macintosh-Waveshare-P4-10.1-v3.4.bin
+#   release/M5Tab-Macintosh-v4.0.bin
+#   release/M5Tab-Macintosh-Waveshare-P4-10.1-v4.0.bin
 ```
 
 The release binary can be flashed with a single esptool command:
 
 ```bash
 esptool --chip esp32p4 --port /dev/cu.usbmodem* \
-    --baud 921600 write-flash 0x0 release/M5Tab-Macintosh-v3.4.bin
+    --baud 921600 write-flash 0x0 release/M5Tab-Macintosh-v4.0.bin
 ```
 
 ---
 
-## Boot GUI
+## Pre-Boot Environment
 
-On startup, a **classic Mac-style boot configuration screen** appears:
+On every startup, a **classic Mac-style pre-boot configuration screen**
+appears before the 68k actually starts. This is where you pick the
+disk, CD, RAM size, WiFi, shared folder, and (on Tab5) USB Disk mode.
 
-```
-┌─────────────────────────────────────────┐
-│           BasiliskII                    │
-│        Starting in 3...                 │
-│                                         │
-│    Disk: Macintosh.dsk                  │
-│    RAM: 8 MB                            │
-│    WiFi: 192.168.1.100                  │
-│                                         │
-│  ┌─────────────────────────────────┐    │
-│  │       Change Settings           │    │
-│  └─────────────────────────────────┘    │
-└─────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="screenshots/v4-Preboot.jpeg" width="70%" alt="Pre-boot configuration environment"/>
+</p>
 
-### Features
+### How to enter the pre-boot environment
 
-- **3-second countdown** to auto-boot with saved settings
-- **Tap to configure** disk images, CD-ROMs, RAM size, and WiFi
-- **WiFi auto-connect** - countdown pauses while connecting
-- **Settings persistence** saved to `/basilisk_settings.txt` on SD card
-- **Touch-friendly** large buttons designed for the 5" touchscreen
+1. Power on (or reset) the device. The Happy Mac splash shows while a
+   3-second countdown ticks down at the bottom of the screen.
+2. **Tap "Change Settings"** during that countdown. The countdown
+   halts and you're dropped into the pre-boot settings screen. Stay
+   there as long as you want — nothing auto-boots out from under you.
+3. To get back here later, just power-cycle or hit reset. There is no
+   in-emulator way back; the 68k has to stop first.
 
-### Configuration Options
+If you don't tap anything, the emulator boots with the last saved
+settings after 3 seconds (or after WiFi finishes connecting, whichever
+is later — WiFi connect can extend the pause up to ~10 s).
+
+### What you can change
 
 | Setting | Options | Default |
 |---------|---------|---------|
 | Hard Disk | Any `.dsk` or `.img` file on SD root | First found |
 | CD-ROM | Any `.iso` file on SD root, or None | None |
 | RAM Size | 4 MB, 8 MB, 12 MB, 16 MB | 8 MB |
-| Audio | Enable/disable sound output | Enabled |
-| WiFi | Configure SSID and password | None |
+| Audio | Enable / disable sound output | Enabled |
+| WiFi | SSID + password via on-screen keyboard | None |
+| Shared Folder | Any folder on the SD card — appears as a mounted volume in Mac OS | None |
+| USB Disk (Tab5 only) | Expose the SD card over USB Mass Storage via USB-A | Off |
+
+Settings are persisted to `/basilisk_settings.txt` on the SD card, so
+the next boot starts with the same layout. The settings UI itself
+lives in [`src/basilisk/boot_gui.cpp`](src/basilisk/boot_gui.cpp).
 
 ### WiFi Setup
 
@@ -507,6 +528,44 @@ The capacitive touchscreen acts as a single-button mouse:
 - **Tap** = Click
 - **Drag** = Click and drag
 - Coordinates are scaled from 1280×720 display to 640×360 Mac screen
+
+### On-Screen Keyboard & Gaming Overlay (v4.0)
+
+The capacitive touchscreen can spawn a full **on-screen keyboard** or a
+**gaming D-pad overlay** without plugging in anything. Toggle them with
+multi-finger tap gestures anywhere on the Mac screen — the Mac mouse
+still works for single-finger touches that land outside the overlay.
+
+| Gesture | Action |
+|---------|--------|
+| **Three-finger tap** | Show / hide the QWERTY keyboard overlay |
+| **Four-finger tap** | Show / hide the gaming D-pad overlay |
+| Same gesture while an overlay is up | Hides that overlay |
+| Opposite gesture while an overlay is up | Switches to the other overlay |
+
+**Keyboard overlay** — full QWERTY with sticky Shift, Ctrl, Option,
+and Command modifiers (tap once to latch, tap again to unlatch), plus
+an arrow cluster. Keystrokes inject real ADB events so Cmd-S, Cmd-Q,
+Cmd-Shift-3, etc. all work.
+
+<p align="center">
+  <img src="screenshots/v4-M5Keyboard.jpeg" width="45%" alt="QWERTY overlay on the M5Stack Tab5"/>
+  <img src="screenshots/v4-WaveshareBootKeyboard.jpeg" width="45%" alt="QWERTY overlay on the Waveshare P4 10.1"/>
+</p>
+
+**Gaming overlay** — on-screen D-pad mapped to the Mac arrow keys, plus
+Esc / Return / Space / Option action buttons for classic Mac games that
+expect keyboard input (Glider PRO, Crystal Quest, Marathon, etc.).
+
+<p align="center">
+  <img src="screenshots/v4-M5Gamemode.jpeg" width="70%" alt="Gaming D-pad overlay on the M5Stack Tab5"/>
+</p>
+
+The overlay renders as a 25% sub-pixel stipple so you can still see the
+Mac content behind it. Held keys overlay a 50% black checker for a
+pressed look; latched modifiers use the opposite checker to read
+distinctly from momentary presses. The full implementation lives in
+[`src/basilisk/touch_overlay.cpp`](src/basilisk/touch_overlay.cpp).
 
 ### USB Keyboard
 
