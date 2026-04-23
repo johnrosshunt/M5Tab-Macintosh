@@ -21,7 +21,15 @@ typedef struct BoardTouchDetail {
     bool pressed;
     int  x;
     int  y;
+    int  id;   /* Stable touch-slot id from the controller; -1 when !pressed. */
 } BoardTouchDetail;
+
+#define BOARD_TOUCH_MAX_POINTS 5
+
+typedef struct BoardTouchMulti {
+    uint8_t          count;     /* Number of currently-pressed fingers (0..BOARD_TOUCH_MAX_POINTS). */
+    BoardTouchDetail p[BOARD_TOUCH_MAX_POINTS];
+} BoardTouchMulti;
 
 bool BoardTouch_Init(void);
 
@@ -33,9 +41,17 @@ void BoardTouch_Update(void);
 
 /**
  * @brief Get the latest touch state. Coordinates are in physical display
- *        pixels. x/y are 0 when !pressed.
+ *        pixels. x/y are 0 when !pressed. Equivalent to the first slot in
+ *        BoardTouch_GetMulti() when any finger is pressed.
  */
 BoardTouchDetail BoardTouch_GetDetail(void);
+
+/**
+ * @brief Get up to BOARD_TOUCH_MAX_POINTS active touch points. Coordinates
+ *        are in physical display pixels (landscape after HAL rotation).
+ *        `out->count` is 0 when nothing is pressed.
+ */
+void BoardTouch_GetMulti(BoardTouchMulti *out);
 
 #ifdef __cplusplus
 } /* extern "C" */

@@ -23,6 +23,7 @@
 #include "board.h"
 #include "board_touch.h"
 #include "board_display.h"
+#include "touch_overlay.h"
 
 #if defined(BOARD_M5STACK_TAB5)
 #include <M5Unified.h>
@@ -266,22 +267,10 @@ static int display_width  = BOARD_DISPLAY_WIDTH;
 static int display_height = BOARD_DISPLAY_HEIGHT;
 
 // Input enable flags
-static bool touch_enabled = true;
 static bool keyboard_enabled = true;
-
-// Touch state
-static bool touch_was_pressed = false;
-static bool touch_click_pending = false; // Deferred mouse-down (one cycle after cursor move)
-static int last_touch_x = 0;
-static int last_touch_y = 0;
-
-// Touch start position and drag deadzone
-static int touch_start_x = 0;           // Position where touch started (Mac coords)
-static int touch_start_y = 0;
-static bool is_dragging = false;        // True once movement exceeds deadzone
-
-// Deadzone threshold - prevents micro-jitter during taps from moving icons
-#define TAP_MOVEMENT_THRESHOLD 8        // Mac pixels - movement beyond this = drag
+// Touch enable is owned by touch_overlay.cpp now; we keep a local shadow
+// for InputSetTouchEnabled() to forward without pulling in a getter.
+static bool touch_enabled = true;
 
 // USB device connection state
 static bool keyboard_connected = false;
@@ -880,119 +869,19 @@ private:
 // ============================================================================
 // Touch Input Handling
 // ============================================================================
+//
+// All touch handling (single-finger mouse, 3/4-finger gesture, overlay key
+// press/release, 25% stipple compositor hooks) now lives in touch_overlay.cpp
+// so the mouse pipeline and the overlay pipeline share one view of the
+// touchscreen. We pump it here with the current multi-point state.
 
-/*
- *  Convert display coordinates to Mac screen coordinates
- *  Display is 1280x720, Mac screen is 640x360 (2x scale factor)
- */
-static void convertTouchToMac(int touch_x, int touch_y, int *mac_x, int *mac_y)
-{
-    // Scale from display coordinates to Mac coordinates
-    *mac_x = (touch_x * mac_screen_width) / display_width;
-    *mac_y = (touch_y * mac_screen_height) / display_height;
-    
-    // Clamp to valid range
-    if (*mac_x < 0) *mac_x = 0;
-    if (*mac_x >= mac_screen_width) *mac_x = mac_screen_width - 1;
-    if (*mac_y < 0) *mac_y = 0;
-    if (*mac_y >= mac_screen_height) *mac_y = mac_screen_height - 1;
-}
-
-/*
- *  Calculate distance between two points
- */
-static int touchDistance(int x1, int y1, int x2, int y2)
-{
-    int dx = x2 - x1;
-    int dy = y2 - y1;
-    // Use Manhattan distance for simplicity (faster than sqrt)
-    int dist = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy);
-    return dist;
-}
-
-/*
- *  Process touch panel input
- *  Called from InputPoll() to handle touch events
- *
- *  On touch start, moves the cursor and defers ADBMouseDown by one poll cycle
- *  so the Mac processes the new cursor position before the click arrives.
- *  Double-click detection is handled natively by Classic Mac OS.
- *  A small movement deadzone prevents micro-jitter during taps from
- *  accidentally dragging icons.
- */
 static void processTouchInput(void)
 {
     if (!touch_enabled) return;
 
-    // Get touch state from the board HAL (M5.Touch on Tab5, GT911 on Waveshare)
-    BoardTouchDetail touch_detail = BoardTouch_GetDetail();
-
-    bool is_pressed = touch_detail.pressed;
-    int touch_x = touch_detail.x;
-    int touch_y = touch_detail.y;
-
-    // Convert to Mac coordinates
-    int mac_x, mac_y;
-    convertTouchToMac(touch_x, touch_y, &mac_x, &mac_y);
-
-    if (is_pressed) {
-        if (!touch_was_pressed) {
-            // ========== TOUCH START ==========
-            ADBSetRelMouseMode(false);
-            touch_was_pressed = true;
-
-            // Record starting position for deadzone
-            touch_start_x = mac_x;
-            touch_start_y = mac_y;
-            is_dragging = false;
-
-            // Move cursor to touch position first; defer mouse-down by one
-            // poll cycle so the Mac processes the new position before the click
-            ADBMouseMoved(mac_x, mac_y);
-            touch_click_pending = true;
-
-        } else {
-            // ========== TOUCH HELD ==========
-
-            // Send deferred mouse-down (one cycle after cursor moved)
-            if (touch_click_pending) {
-                ADBMouseMoved(touch_start_x, touch_start_y);
-                ADBMouseDown(0);
-                touch_click_pending = false;
-            }
-
-            int dist_from_start = touchDistance(mac_x, mac_y,
-                                               touch_start_x, touch_start_y);
-
-            // Start tracking as drag once past deadzone
-            if (!is_dragging && dist_from_start > TAP_MOVEMENT_THRESHOLD) {
-                is_dragging = true;
-            }
-
-            // Only update cursor while dragging (deadzone prevents jitter during taps)
-            if (is_dragging) {
-                if (mac_x != last_touch_x || mac_y != last_touch_y) {
-                    ADBMouseMoved(mac_x, mac_y);
-                }
-            }
-        }
-
-        last_touch_x = mac_x;
-        last_touch_y = mac_y;
-
-    } else {
-        if (touch_was_pressed) {
-            // ========== TOUCH RELEASE ==========
-            // If click was still pending (very fast tap), send it now
-            if (touch_click_pending) {
-                ADBMouseMoved(touch_start_x, touch_start_y);
-                ADBMouseDown(0);
-                touch_click_pending = false;
-            }
-            ADBMouseUp(0);
-            touch_was_pressed = false;
-        }
-    }
+    BoardTouchMulti multi;
+    BoardTouch_GetMulti(&multi);
+    TouchOverlay_Update(&multi);
 }
 
 /*
@@ -1077,21 +966,20 @@ bool InputInit(void)
     
     Serial.printf("[INPUT] Display size: %dx%d\n", display_width, display_height);
     Serial.printf("[INPUT] Mac screen size: %dx%d\n", mac_screen_width, mac_screen_height);
-    
-    touch_was_pressed = false;
-    touch_click_pending = false;
-    last_touch_x = 0;
-    last_touch_y = 0;
-    touch_start_x = 0;
-    touch_start_y = 0;
-    is_dragging = false;
-    
+
     last_led_state = 0;
     last_led_check_time = 0;
-    
+
     ADBSetRelMouseMode(false);
-    
-    Serial.println("[INPUT] Touch input enabled");
+
+    /* Overlay module owns mouse routing, multi-touch gesture detection,
+     * and on-screen keyboard key dispatch. Initialize it with the actual
+     * physical display size and Mac framebuffer size so the stipple
+     * compositor and mouse-coordinate scaling are both correct. */
+    TouchOverlay_Init(display_width, display_height,
+                      mac_screen_width, mac_screen_height);
+
+    Serial.println("[INPUT] Touch input enabled (multi-touch overlay ready)");
     
     Serial.println("[INPUT] Initializing USB Host (hub support enabled)...");
     usbHost = new MultiDeviceUsbHost();
@@ -1132,15 +1020,10 @@ void InputExit(void)
         vTaskDelay(pdMS_TO_TICKS(50));
         input_task_handle = NULL;
     }
-    
-    if (touch_was_pressed) {
-        if (!touch_click_pending) {
-            ADBMouseUp(0);
-        }
-        touch_was_pressed = false;
-        touch_click_pending = false;
-    }
-    
+
+    /* Release any held overlay keys / mouse state. */
+    TouchOverlay_Shutdown();
+
     // Release any injected right-click Control key
     if (right_click_ctrl_injected) {
         ADBKeyUp(0x36);
@@ -1174,15 +1057,7 @@ void InputSetScreenSize(int width, int height)
 void InputSetTouchEnabled(bool enabled)
 {
     touch_enabled = enabled;
-    if (!enabled && touch_was_pressed) {
-        // Release mouse if it was pressed
-        if (!touch_click_pending) {
-            ADBMouseUp(0);
-        }
-        touch_was_pressed = false;
-        touch_click_pending = false;
-        is_dragging = false;
-    }
+    TouchOverlay_SetTouchEnabled(enabled);
 }
 
 void InputSetKeyboardEnabled(bool enabled)

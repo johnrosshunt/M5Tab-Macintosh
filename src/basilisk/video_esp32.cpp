@@ -34,6 +34,7 @@
 
 #include "board_config.h"
 #include "board_display.h"
+#include "touch_overlay.h"
 
 // FreeRTOS for dual-core support
 #include "freertos/FreeRTOS.h"
@@ -721,6 +722,47 @@ void VideoMarkDirtyRange(uint32 offset, uint32 size)
 }
 
 /*
+ *  Mark every tile that intersects a physical-display rectangle dirty.
+ *  Used by external code (touch overlay) to force the video task to
+ *  redraw a region even when the Mac framebuffer hasn't changed. Takes
+ *  physical-display-pixel coordinates and converts them to Mac-tile
+ *  indices via the known PIXEL_SCALE.
+ */
+extern "C" void VideoMarkTilesDirtyRect(int px, int py, int pw, int ph)
+{
+    if (pw <= 0 || ph <= 0) return;
+
+    /* Physical -> Mac coords (PIXEL_SCALE = 2 on both supported boards). */
+    int mx0 = px / PIXEL_SCALE;
+    int my0 = py / PIXEL_SCALE;
+    int mx1 = (px + pw + PIXEL_SCALE - 1) / PIXEL_SCALE;
+    int my1 = (py + ph + PIXEL_SCALE - 1) / PIXEL_SCALE;
+    if (mx0 < 0) mx0 = 0;
+    if (my0 < 0) my0 = 0;
+    if (mx1 > MAC_SCREEN_WIDTH)  mx1 = MAC_SCREEN_WIDTH;
+    if (my1 > MAC_SCREEN_HEIGHT) my1 = MAC_SCREEN_HEIGHT;
+    if (mx0 >= mx1 || my0 >= my1) return;
+
+    int tx0 = mx0 / TILE_WIDTH;
+    int ty0 = my0 / TILE_HEIGHT;
+    int tx1 = (mx1 + TILE_WIDTH  - 1) / TILE_WIDTH;
+    int ty1 = (my1 + TILE_HEIGHT - 1) / TILE_HEIGHT;
+    if (tx1 > TILES_X) tx1 = TILES_X;
+    if (ty1 > TILES_Y) ty1 = TILES_Y;
+
+    for (int ty = ty0; ty < ty1; ++ty) {
+        for (int tx = tx0; tx < tx1; ++tx) {
+            markTileDirtyBit(ty * TILES_X + tx);
+        }
+    }
+
+    /* Wake the video task so the redraw happens promptly. */
+    if (video_task_handle != NULL) {
+        xTaskNotifyGive(video_task_handle);
+    }
+}
+
+/*
  *  Collect write-dirty tiles into the render dirty bitmap and clear write bitmap
  *  Returns the number of dirty tiles
  *  Called at the start of each video frame
@@ -1022,17 +1064,23 @@ static void renderAndPushDirtyTiles(uint8 *src_buffer, uint16 *local_palette)
             
             // STEP 4: Render from the snapshot (not from the live framebuffer)
             renderTileFromSnapshot(current_snapshot, local_palette, current_buffer);
-            
+
+            // STEP 4.5: Composite any active touch overlay (on-screen
+            // keyboard / gaming pad) onto this tile before pushing.
+            // Cheap no-op when the overlay is hidden.
+            int dst_start_x = tx * tile_pixel_width;
+            int dst_start_y = ty * tile_pixel_height;
+            TouchOverlay_CompositeTile(dst_start_x, dst_start_y,
+                                       tile_pixel_width, tile_pixel_height,
+                                       current_buffer);
+
             // STEP 5: Wait for any pending DMA before using its buffer
             if (dma_pending) {
                 BoardDisplay_WaitPush();
                 dma_pending = false;
             }
-            
+
             // STEP 6: Push to display using async DMA
-            int dst_start_x = tx * tile_pixel_width;
-            int dst_start_y = ty * tile_pixel_height;
-            
             BoardDisplay_PushTile(dst_start_x, dst_start_y,
                                   tile_pixel_width, tile_pixel_height,
                                   current_buffer);
