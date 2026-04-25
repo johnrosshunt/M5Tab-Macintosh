@@ -134,31 +134,90 @@ static uint8_t get_effective_volume(void)
 /*
  *  Reset ES8388 codec via I2C with proper timing.
  *
- *  After a soft reboot the codec retains whatever state it was in (it stays
- *  powered).  The M5Unified callback writes the reset register back-to-back
- *  with no delay, which is insufficient when the codec was actively processing
- *  audio.  This pre-reset gives the codec adequate time to complete its
- *  internal reset before the normal initialisation sequence runs.
+ *  Why this exists: the ES8388 stays powered through ESP32 software resets,
+ *  so after a crash, panic, or `esp_restart()` it retains whatever state it
+ *  was in - mid-DMA, mid-PLL-lock, charge pump active, DAC powered up with
+ *  garbage configuration. M5Unified's normal init writes the chip-reset
+ *  register back-to-back with no delay, which can leave the codec stuck
+ *  enough that audio is silent until the user pulls power. This routine
+ *  forces a full power-down + reset cycle before the normal init runs.
+ *
+ *  Sequence:
+ *    1. Mute the NS4150 power amp via PI4IO1 GPIO so the user doesn't
+ *       hear pops during the rest of the dance.
+ *    2. Power down the DAC, ADC, charge pump, and analog reference in
+ *       known order so the chip is quiescent when we toggle the reset.
+ *       Doing this with the chip running in an unknown state was the
+ *       leading cause of the post-crash audio dead-state.
+ *    3. Assert software reset (chip control 1, bit 7) for 100 ms - the
+ *       datasheet says >= 1 ms but bench testing shows the DAC PLL needs
+ *       longer to settle if it had been actively producing samples.
+ *    4. Release reset and wait 50 ms for the internal POR to complete
+ *       and the I2C interface to come back online.
+ *    5. Read back register 0 to verify the chip is responsive. If it
+ *       isn't (bus error, 0xFF, etc.) we log it but still continue -
+ *       Speaker.begin() will get its own crack at it.
  */
 static constexpr uint8_t ES8388_I2C_ADDR  = 0x10;
 static constexpr uint8_t PI4IO1_I2C_ADDR  = 0x43;
 
+/* ES8388 register map (subset). Names match the ES8388 datasheet. */
+static constexpr uint8_t ES8388_REG_CHIP_CTRL1   = 0x00;
+static constexpr uint8_t ES8388_REG_CHIP_CTRL2   = 0x01;
+static constexpr uint8_t ES8388_REG_CHIP_PWR     = 0x02;
+static constexpr uint8_t ES8388_REG_ADC_PWR      = 0x03;
+static constexpr uint8_t ES8388_REG_DAC_PWR      = 0x04;
+static constexpr uint8_t ES8388_REG_DAC_CTRL3    = 0x19;  /* DAC mute */
+static constexpr uint8_t ES8388_REG_LOUT1_VOL    = 0x2E;
+static constexpr uint8_t ES8388_REG_ROUT1_VOL    = 0x2F;
+
 static void reset_es8388(void)
 {
-    Serial.println("[AUDIO] Pre-resetting ES8388 codec for warm boot...");
+    Serial.println("[AUDIO] Force-resetting ES8388 codec...");
 
-    // Mute the amplifier while we reset to avoid pops.
+    /* 1) Hard mute the NS4150 power amp before we touch anything else.
+     * The PI4IO1 GPIO expander on the Tab5 gates the amp's enable line
+     * through bit 1 of register 0x05. Driving it low isolates the
+     * speaker from any residual DC offset on the codec line outputs. */
     M5.In_I2C.bitOff(PI4IO1_I2C_ADDR, 0x05, 0b00000010, 400000);
+    delay(5);
 
-    // Assert codec reset (register 0, bit 7).
-    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, 0x00, 0x80, 400000);
+    /* 2) Software-mute the DAC outputs and zero LOUT1/ROUT1 so the
+     * line drivers are silent before we cut their power. Best-effort -
+     * if the codec is wedged these will fail and that's OK. */
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_DAC_CTRL3, 0x04, 400000);
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_LOUT1_VOL, 0x00, 400000);
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_ROUT1_VOL, 0x00, 400000);
+
+    /* 3) Power down DAC, ADC, charge pump, analog reference. The order
+     * matters per the ES8388 power-down sequence: outputs first, then
+     * DAC core, then ADC core, then chip-wide power. Each write fires
+     * even if the previous one failed; we want to push the chip toward
+     * a known state regardless of how it started. */
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_DAC_PWR,  0xC0, 400000);  /* DAC L+R off */
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_ADC_PWR,  0xFF, 400000);  /* ADC fully off */
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_CHIP_PWR, 0xFF, 400000);  /* analog/digital powered down */
+    delay(20);
+
+    /* 4) Assert software reset (chip control 1 bit 7). Hold long
+     * enough that any in-flight I2S frame, PLL lock, and DAC zero-
+     * crossing detector all finish. */
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_CHIP_CTRL1, 0x80, 400000);
     delay(100);
 
-    // Release reset.
-    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, 0x00, 0x00, 400000);
+    /* 5) Release reset and let internal POR complete. */
+    M5.In_I2C.writeRegister8(ES8388_I2C_ADDR, ES8388_REG_CHIP_CTRL1, 0x00, 400000);
     delay(50);
 
-    Serial.println("[AUDIO] ES8388 codec pre-reset complete");
+    /* 6) Sanity-read chip control 1. Anything other than 0x00/0x06
+     * means the chip didn't accept our writes; log but proceed so
+     * Speaker.begin() can still try. */
+    uint8_t ctrl1 = M5.In_I2C.readRegister8(ES8388_I2C_ADDR, ES8388_REG_CHIP_CTRL1, 400000);
+    if (ctrl1 == 0xFF) {
+        Serial.println("[AUDIO] WARN: ES8388 not responding on I2C after reset");
+    } else {
+        Serial.printf("[AUDIO] ES8388 reset OK, chip ctrl1=0x%02X\n", ctrl1);
+    }
 }
 
 /*
@@ -168,16 +227,19 @@ static bool init_speaker(void)
 {
     Serial.println("[AUDIO] Initializing M5Unified Speaker...");
 
-    // After a crash or software reboot the ES8388 codec keeps its previous
-    // state because it never loses power.  The normal M5Unified init writes
-    // the reset register with no delay, which can leave the codec stuck.
-    // Perform an explicit reset with proper timing so the codec is in a
-    // known-good state before Speaker.begin() reconfigures it.
+    /* Always run a full ES8388 reset before Speaker.begin(), regardless
+     * of esp_reset_reason. The codec keeps its previous state through
+     * any kind of ESP32 reset (it has its own power rail), and the
+     * full power-down + reset sequence is harmless when the chip is
+     * already cold-booted. Previously we gated this on warm-boot only,
+     * which left "first boot after a brownout" cases relying on
+     * M5Unified's compressed init path - leading to occasional
+     * post-crash silent-audio reports that only a power cycle could
+     * fix. Logging the reset reason for diagnostics. */
     esp_reset_reason_t reason = esp_reset_reason();
-    if (reason != ESP_RST_POWERON && reason != ESP_RST_UNKNOWN) {
-        reset_es8388();
-    }
-    
+    Serial.printf("[AUDIO] esp_reset_reason=%d\n", (int)reason);
+    reset_es8388();
+
     // Get current speaker config
     auto spk_cfg = M5.Speaker.config();
     

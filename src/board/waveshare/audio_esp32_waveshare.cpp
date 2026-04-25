@@ -36,6 +36,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "driver/i2s_std.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 
 #define DEBUG 0
 #include "debug.h"
@@ -115,12 +116,118 @@ static int get_effective_volume_percent(void)
     return (int)pct;
 }
 
+/*
+ * Force-reset the ES8311 codec via I2C before the BSP's normal init path
+ * runs. Mirrors the ES8388 reset on Tab5: the codec keeps its previous
+ * state through ESP32 software resets and crashes (it has its own power
+ * rail), and the BSP's es8311_codec_new() does a fairly compressed init
+ * that can leave the chip stuck if it was actively producing samples
+ * when the SoC reset.
+ *
+ * Sequence:
+ *   1. Drive the NS4150B power-amp enable pin LOW so the speaker is
+ *      isolated during the reset (no pops, no DC click).
+ *   2. Issue an I2C software reset on the ES8311 (register 0x00 bit 7),
+ *      hold for 50 ms, release. Done via i2c_master_bus + i2c_master_dev
+ *      since the Arduino Wire instance is busy with display/touch and we
+ *      want to share the BSP's existing master bus.
+ *   3. Brief settle delay so the chip's internal POR finishes before the
+ *      BSP's bsp_audio_codec_speaker_init() walks its init register list.
+ *
+ * Any I2C error is logged but non-fatal - the BSP init below will get
+ * another shot at the chip.
+ */
+static constexpr uint8_t ES8311_I2C_ADDR        = 0x18;
+static constexpr uint8_t ES8311_REG_RESET       = 0x00;
+static constexpr uint8_t ES8311_RESET_BIT       = 0x80;
+
+static void reset_es8311(void)
+{
+    Serial.println("[AUDIO] Force-resetting ES8311 codec...");
+
+    /* Make sure the BSP's I2C master bus is up. bsp_i2c_init() is
+     * idempotent (the BSP guards against double-init) so calling it
+     * here before audio init is safe even though the panel/touch
+     * already brought it up earlier in boot. */
+    bsp_i2c_init();
+
+    /* Mute the amp first. The ES8311 driver normally manages this pin
+     * but since we're talking to the chip ahead of the driver, pull it
+     * down ourselves so the speaker is silent during the reset. */
+    gpio_config_t pa_cfg = {
+        .pin_bit_mask = 1ULL << BSP_POWER_AMP_IO,
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&pa_cfg);
+    gpio_set_level((gpio_num_t)BSP_POWER_AMP_IO, 0);
+    delay(5);
+
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (bus == NULL) {
+        Serial.println("[AUDIO] WARN: bsp_i2c_get_handle returned NULL, skipping codec reset");
+        return;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address  = ES8311_I2C_ADDR,
+        .scl_speed_hz    = 100000,
+    };
+    i2c_master_dev_handle_t dev = NULL;
+    esp_err_t err = i2c_master_bus_add_device(bus, &dev_cfg, &dev);
+    if (err != ESP_OK || dev == NULL) {
+        Serial.printf("[AUDIO] WARN: i2c add device failed (0x%x), skipping codec reset\n", err);
+        return;
+    }
+
+    /* Assert reset (reg 0x00 bit 7). */
+    uint8_t reset_assert[2]   = { ES8311_REG_RESET, ES8311_RESET_BIT };
+    uint8_t reset_release[2]  = { ES8311_REG_RESET, 0x00 };
+
+    err = i2c_master_transmit(dev, reset_assert, sizeof(reset_assert), 50 /*ms*/);
+    if (err != ESP_OK) {
+        Serial.printf("[AUDIO] WARN: ES8311 reset assert failed (0x%x)\n", err);
+    }
+    delay(50);
+
+    err = i2c_master_transmit(dev, reset_release, sizeof(reset_release), 50 /*ms*/);
+    if (err != ESP_OK) {
+        Serial.printf("[AUDIO] WARN: ES8311 reset release failed (0x%x)\n", err);
+    }
+    delay(20);
+
+    /* Sanity read of register 0x00. After release, bit 7 should be 0. */
+    uint8_t reg_addr  = ES8311_REG_RESET;
+    uint8_t reg_value = 0xFF;
+    err = i2c_master_transmit_receive(dev, &reg_addr, 1, &reg_value, 1, 50);
+    if (err != ESP_OK) {
+        Serial.printf("[AUDIO] WARN: ES8311 readback failed (0x%x)\n", err);
+    } else {
+        Serial.printf("[AUDIO] ES8311 reset OK, reg0x00=0x%02X\n", reg_value);
+    }
+
+    i2c_master_bus_rm_device(dev);
+}
+
 static bool init_speaker(void)
 {
     Serial.println("[AUDIO] Initializing ES8311 codec via Waveshare BSP...");
 
-    /* Force-drive the NS4150B power amplifier enable pin high. The ES8311
-     * driver normally toggles it via the gpio_if registered by
+    /* Always run the full ES8311 reset before BSP init - the codec
+     * keeps its state across ESP32 resets and the BSP's init path
+     * doesn't itself perform a power-down + chip reset, so a crash
+     * mid-playback could otherwise leave the codec stuck enough to
+     * produce silent audio until the next power cycle. The reset is
+     * harmless on a fresh power-on. */
+    reset_es8311();
+
+    /* Re-drive the NS4150B power amplifier enable pin high. reset_es8311()
+     * dropped it low during the I2C reset; bring it back up now so the
+     * BSP's init writes immediately produce audible output. The ES8311
+     * driver normally toggles this pin via the gpio_if registered by
      * audio_codec_new_gpio(), but because we construct the codec via the
      * BSP wrapper we want to be sure the amp is on even before the first
      * DMA buffer plays. */

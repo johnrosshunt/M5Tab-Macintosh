@@ -52,3 +52,14 @@ CONFIG_BSP_SPIFFS_FORMAT_ON_MOUNT_FAIL=n
 # pre-boot, HID host only once the emulator is running.
 CONFIG_TINYUSB_MSC_ENABLED=y
 CONFIG_TINYUSB_MSC_BUFSIZE=8192
+
+# --- FatFs: future-proofing for exFAT support ---
+# pioarduino currently ships FatFs precompiled with FF_FS_EXFAT=0, so
+# these settings are no-ops today. They are recorded here so that when
+# the precompiled archive eventually enables exFAT we pick it up with
+# no additional change. board_sd_waveshare.cpp's exFAT probe surfaces
+# the current limitation to users with a clear "reformat as FAT32"
+# message instead of a generic init failure.
+CONFIG_FATFS_USE_EXFAT=y
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255

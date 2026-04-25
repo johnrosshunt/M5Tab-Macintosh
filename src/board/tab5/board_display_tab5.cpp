@@ -130,10 +130,13 @@ extern "C" bool BoardDisplay_Init(void)
     }
 
     /* Tab5 ships with the panel ribbon at the top of the landscape view
-     * when using the default 90-CW mapping. Flip the landscape output
-     * 180 degrees so the Mac desktop appears right-side up when the
-     * device is held with the USB-C port on the left.                   */
-    s_gfx.setFlip180(true);
+     * when using the default 90-CW mapping. Default to flipping the
+     * landscape output 180 degrees so the Mac desktop appears right-
+     * side up when the device is held with the USB-C port on the left.
+     * The boot GUI can override this via BoardDisplay_SetFlip180() once
+     * it knows the user's preference - the call drives both this flip
+     * and the touch driver's coordinate transform. */
+    BoardDisplay_SetFlip180(true);
 
     /* Do NOT explicitly fillScreen + flushAllForce here. beginExternalFb
      * already zeroed the DPI framebuffer, and the DPI is continuously
@@ -264,6 +267,26 @@ extern "C" void BoardDisplay_SetBacklight(int percent)
      * on a channel allocated by M5GFX). Reuse its setter. Maps 0-100
      * percent to the 0-255 brightness range LovyanGFX expects. */
     M5.Display.setBrightness((percent * 255) / 100);
+}
+
+/* Whether the landscape framebuffer is currently flipped 180. Initialised
+ * in BoardDisplay_Init() from the panel default and then updated by the
+ * boot GUI when the user changes the Rotate-180 checkbox. The touch
+ * driver reads this through BoardTouch_IsFlipped180() so its coordinate
+ * transform stays in sync with what's on screen. */
+static bool s_flip180_active = true;
+
+extern "C" void BoardDisplay_SetFlip180(bool flip)
+{
+    s_flip180_active = flip;
+    s_gfx.setFlip180(flip);
+}
+
+/* Allow the touch HAL to query the current state without a public header
+ * for an internal-only flag. */
+extern "C" bool BoardDisplayTab5_GetFlip180(void)
+{
+    return s_flip180_active;
 }
 
 MiniGfx &BoardDisplay_Gfx_Board(void)

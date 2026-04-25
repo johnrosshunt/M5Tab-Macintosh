@@ -40,6 +40,23 @@ void BoardDisplay_FillRect(int x, int y, int w, int h, uint16_t color);
 void BoardDisplay_SetBacklight(int percent);
 
 /**
+ * @brief Set whether the framebuffer should be rotated 180 degrees
+ *        before being pushed to the panel.
+ *
+ *  The Tab5 default is true (matches v4.0, "USB-C port on the left"
+ *  hold orientation); false flips the image so the USB-C port is on
+ *  the right. The Waveshare 10.1" panel orientation is fixed by the
+ *  ribbon location, so this is a no-op there.
+ *
+ *  Must be called before BoardDisplay_Init() takes effect, OR after
+ *  init but before any further BoardDisplay_PushTile / Present calls,
+ *  otherwise the tile-rotation map and the panel image will disagree
+ *  for one frame. Boot GUI applies it after the user dismisses the
+ *  settings screen and before the splash transition.
+ */
+void BoardDisplay_SetFlip180(bool flip);
+
+/**
  * @brief Flush the software drawing surface to the physical panel. On
  *        both boards this copies the MiniGfx PSRAM framebuffer to the
  *        MIPI-DSI back buffer via esp_lcd_panel_draw_bitmap.

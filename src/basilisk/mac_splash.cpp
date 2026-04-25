@@ -73,28 +73,31 @@ namespace MacSplash {
 
 void Begin()
 {
-    /* Paint the splash FIRST so the 1-second touch-warmup delay below
-     * happens while the user is looking at the Happy Mac, not at a
-     * plain black screen. Previously this order was reversed and that
-     * produced a visible two-step transition (black -> splash). The
-     * warmup only needs Board_Update() to pump the touch controller;
-     * it does not depend on the display state.                        */
+    /* Paint the splash FIRST so the touch-warmup happens while the
+     * user is looking at the Happy Mac, not at a plain black screen. */
     Serial.printf("[MAC_SPLASH] Painting splash (%dx%d)\n",
                   BoardDisplay_Width(), BoardDisplay_Height());
     paint_splash();
 
-    /* Warm up the touch panel before starting the polling task.
-     * Capacitive controllers typically need a handful of update cycles
-     * after boot before their first report is meaningful. */
-    Serial.println("[MAC_SPLASH] Warming up touch panel...");
-    for (int i = 0; i < 20; i++) {
-        Board_Update();
-        delay(50);
-    }
-
+    /* Start the touch task BEFORE the warmup so any taps the user
+     * lands while the Happy Mac is on screen are actually captured.
+     * Previously the warmup ran first as a synchronous Board_Update
+     * loop, which meant ~1 s of splash-visible time during which the
+     * tap-detection path was completely deaf - users reasonably
+     * tapping the splash had a window of just SPLASH_TAP_WINDOW_MS
+     * minus reaction time and ended up booting straight to Mac OS.
+     * The touch task itself calls Board_Update() every poll, so it
+     * naturally warms up the GT911 once it starts running. */
     if (!BootGUI_StartTouchTask()) {
         Serial.println("[MAC_SPLASH] WARNING: failed to start touch task");
     }
+
+    /* Brief delay so the GT911 has time to produce its first valid
+     * report before WaitForTapOrTimeout consumes events. The touch
+     * task's own ~16 ms poll cadence handles most of the warm-up;
+     * we just need a short head start. */
+    Serial.println("[MAC_SPLASH] Touch task primed");
+    delay(150);
 }
 
 bool WaitForTapOrTimeout(uint32_t ms)

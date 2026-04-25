@@ -18,17 +18,38 @@
 #include "boot_gui.h"
 #include "mac_splash.h"
 
+#include "esp_system.h"        /* esp_register_shutdown_handler */
+
 /* Forward declarations for BasiliskII functions */
 extern void basilisk_setup(void);
 extern void basilisk_loop(void);
 extern bool basilisk_is_running(void);
 
+/* Sys_flush_now lives in src/basilisk/sys_esp32.cpp; declared in sys.h
+ * but pulling that header here drags in the BasiliskII type macros, so
+ * forward-declare instead. ABI-compatible (extern "C" not needed - the
+ * symbol is C++-mangled identically since it has C-style signature). */
+extern void Sys_flush_now(void);
+
+/* ESP-IDF shutdown hook: drain any dirty disk-image writes to the SD
+ * card on programmatic reset (esp_restart), panic, or watchdog. Does
+ * not catch a hard power pull, but does catch every other path that
+ * goes through the IDF shutdown chain. */
+static void on_system_shutdown(void)
+{
+    Sys_flush_now();
+}
+
 /* ============================================================================
- * Window during which a tap anywhere opens the configuration menu. Kept
- * short on purpose - the splash is supposed to feel seamless, not like a
- * boot menu.
+ * Window during which a tap anywhere opens the configuration menu. The
+ * splash is supposed to feel seamless, not like a boot menu, but the
+ * window has to be long enough that a user who watches the Happy Mac
+ * appear and decides to tap actually has time to react. With the
+ * MacSplash::Begin() warmup + start-touch-task flow finishing in ~150 ms,
+ * 4 seconds gives a comfortable reaction window without making "no
+ * tap" boots feel sluggish.
  * ==========================================================================*/
-static const uint32_t SPLASH_TAP_WINDOW_MS = 2000;
+static const uint32_t SPLASH_TAP_WINDOW_MS = 4000;
 
 /* ============================================================================
  * SD card bring-up + ROM existence check
@@ -118,6 +139,17 @@ void setup(void)
         haltWith("SD card or ROM file not found");
     }
 
+    /* Register the SD-flush shutdown hook as soon as the card is up.
+     * Doing it after initSDCard() keeps the hook from firing on a
+     * pre-mount halt (where there is nothing to flush yet) and means
+     * any later esp_restart() / panic still drains pending writes. */
+    esp_err_t hook_err = esp_register_shutdown_handler(&on_system_shutdown);
+    if (hook_err != ESP_OK) {
+        Serial.printf("[MAIN] WARN: shutdown hook register failed (0x%x)\n", hook_err);
+    } else {
+        Serial.println("[MAIN] SD flush shutdown hook registered");
+    }
+
     if (!BootGUI_Init()) {
         haltWith("Boot GUI initialization failed");
     }
@@ -128,12 +160,27 @@ void setup(void)
         BootGUI_FinishWithoutUI();
     }
 
+    /* Apply the user's rotation preference (boot GUI default is 180,
+     * matching v4.0 behaviour). The HAL gates this internally on the
+     * board: Tab5 flips the MiniGfx output and the touch transform,
+     * Waveshare ignores the call since its panel orientation is fixed
+     * by the ribbon. We do this before TransitionToEmulator so the
+     * splash and the Mac framebuffer agree on which way is up. */
+    bool flip = (BootGUI_GetRotation() == 180);
+    BoardDisplay_SetFlip180(flip);
+
     MacSplash::TransitionToEmulator();
 
     Serial.println("[MAIN] Starting BasiliskII emulator...");
     basilisk_setup();
 
     Serial.println("[MAIN] Emulator exited");
+
+    /* Final sync: emulator just stopped, no more writes are coming.
+     * Push anything still dirty to the card before the user sees the
+     * "safe to power off" splash so the next boot is clean even on a
+     * hard power-cycle from this state. */
+    Sys_flush_now();
 
     /* Paint a classic "it is now safe to switch off your computer"
      * screen so the user isn't left with the stale last Mac framebuffer

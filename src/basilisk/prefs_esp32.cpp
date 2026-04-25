@@ -9,6 +9,10 @@
 #include "boot_gui.h"
 #include "board_config.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <errno.h>
+
 #define DEBUG 0
 #include "debug.h"
 
@@ -80,34 +84,65 @@ void LoadPrefs(const char *vmdir)
     // Get the shared-folder ("Unix root") path for ExtFS. BootGUI stores
     // paths relative to the SD root (e.g. "/Shared"); extfs.cpp / POSIX
     // need the full VFS path so we prepend BOARD_SD_MOUNT_POINT here.
-    // Tab5 mounts the card at "/" and Waveshare at "/sd", so this resolves
-    // to "/Shared" and "/sd/Shared" respectively.
+    // Tab5 mounts the card at "/sd" (Arduino SD default) and Waveshare
+    // at "/sd" (BSP setting), so for both boards a folder picked as
+    // "/Shared" resolves to "/sd/Shared".
+    //
+    // We also stat() the resolved path and try to mkdir() it if missing,
+    // because the silent failure mode (folder picked but not created on
+    // SD) was the leading cause of "shared folder doesn't appear on the
+    // Mac desktop" reports. If stat() still fails after mkdir() we leave
+    // the pref in place - extfs.cpp will log the real errno - so the
+    // serial console shows exactly what went wrong instead of just
+    // "disabled".
     const char* extfs_rel = BootGUI_GetExtFSPath();
     if (extfs_rel && strlen(extfs_rel) > 0) {
         char extfs_vfs_path[BOOT_GUI_MAX_PATH + 8];
-        const char* mount = BOARD_SD_MOUNT_POINT;
-        if (mount == NULL || mount[0] == '\0' ||
-            (mount[0] == '/' && mount[1] == '\0')) {
-            // Mount point is root ("/") - the SD-root-relative path already
-            // starts with '/', so use it verbatim without double-slashing.
-            snprintf(extfs_vfs_path, sizeof(extfs_vfs_path), "%s", extfs_rel);
-        } else {
-            snprintf(extfs_vfs_path, sizeof(extfs_vfs_path), "%s%s",
-                     mount, extfs_rel);
+        snprintf(extfs_vfs_path, sizeof(extfs_vfs_path), "%s%s",
+                 BOARD_SD_MOUNT_POINT, extfs_rel);
+
+        struct stat st;
+        if (stat(extfs_vfs_path, &st) != 0) {
+            Serial.printf("[PREFS] ExtFS path '%s' missing (errno=%d), "
+                          "auto-creating...\n",
+                          extfs_vfs_path, errno);
+            if (mkdir(extfs_vfs_path, 0755) != 0) {
+                Serial.printf("[PREFS] mkdir('%s') failed: errno=%d\n",
+                              extfs_vfs_path, errno);
+            } else {
+                Serial.printf("[PREFS] ExtFS folder created: %s\n",
+                              extfs_vfs_path);
+            }
+        } else if (!S_ISDIR(st.st_mode)) {
+            Serial.printf("[PREFS] ExtFS path '%s' exists but is not a "
+                          "directory; ExtFS will be disabled\n",
+                          extfs_vfs_path);
         }
+
         PrefsReplaceString("extfs", extfs_vfs_path);
         Serial.printf("[PREFS] Shared folder (ExtFS): %s\n", extfs_vfs_path);
     } else {
         PrefsRemoveItem("extfs");
-        Serial.println("[PREFS] Shared folder (ExtFS): disabled");
+        Serial.println("[PREFS] Shared folder (ExtFS): disabled (no folder selected)");
     }
 
     // No GUI
     PrefsReplaceBool("nogui", true);
-    
-    // Boot from first bootable volume
+
+    // Boot from first bootable volume by default. The "Boot from CD"
+    // checkbox in the boot GUI overrides this with the CD-ROM driver
+    // refnum (-62, see CDROMRefNum in cdrom.cpp), which makes Mac OS
+    // pick the CD as the startup disk - same behaviour as holding "C"
+    // at boot on a real Macintosh. We only honour the override when a
+    // CD-ROM image was actually selected; an unattended "boot from CD"
+    // with no disk would leave the Mac stuck at the question-mark.
     PrefsReplaceInt32("bootdrive", 0);
     PrefsReplaceInt32("bootdriver", 0);
+    if (BootGUI_GetBootFromCD() && cdrom_path && strlen(cdrom_path) > 0) {
+        // CDROMRefNum from src/basilisk/cdrom.cpp.
+        PrefsReplaceInt32("bootdriver", -62);
+        Serial.println("[PREFS] Boot order: CD-ROM (forced via Boot-from-CD)");
+    }
     
     // Frame skip (lower = smoother but slower)
     PrefsReplaceInt32("frameskip", 4);

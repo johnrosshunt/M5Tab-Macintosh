@@ -330,6 +330,16 @@ static bool wifi_initialized = false;
 // Audio settings
 static bool audio_enabled = true;  // Default: audio enabled
 
+// "Boot from CD" - when set, LoadPrefs steers bootdrive to the CD-ROM
+// driver refnum so the Mac boots from the selected ISO instead of the
+// hard disk. Equivalent to holding "C" at startup on a real Mac.
+static bool boot_from_cd = false;
+
+// Display rotation in degrees (0 or 180). The Tab5 default is 180 to
+// match v4.0 behaviour (USB-C port on the left); 0 puts the USB-C
+// port on the right. Waveshare ignores this for now.
+static int rotation_degrees = 180;
+
 static const char* SETTINGS_FILE = "/basilisk_settings.txt";
 
 // ============================================================================
@@ -444,6 +454,18 @@ static void loadSettings(void)
         } else if (key == "audio" || key == "audio_enabled") {
             audio_enabled = (value == "yes" || value == "true" || value == "1");
             Serial.printf("[BOOT_GUI] Loaded audio_enabled: %s\n", audio_enabled ? "yes" : "no");
+        } else if (key == "boot_from_cd") {
+            boot_from_cd = (value == "yes" || value == "true" || value == "1");
+            Serial.printf("[BOOT_GUI] Loaded boot_from_cd: %s\n", boot_from_cd ? "yes" : "no");
+        } else if (key == "rotation") {
+            int rot = value.toInt();
+            // Accept 0 or 180; reject anything else and fall back to 180.
+            if (rot == 0 || rot == 180) {
+                rotation_degrees = rot;
+            } else {
+                rotation_degrees = 180;
+            }
+            Serial.printf("[BOOT_GUI] Loaded rotation: %d\n", rotation_degrees);
         }
     }
     
@@ -478,7 +500,11 @@ static void saveSettings(void)
     
     // Save audio settings
     file.printf("audio=%s\n", audio_enabled ? "yes" : "no");
-    
+
+    // v4.1 additions: boot-from-CD and screen rotation.
+    file.printf("boot_from_cd=%s\n", boot_from_cd ? "yes" : "no");
+    file.printf("rotation=%d\n", rotation_degrees);
+
     file.close();
     Serial.println("[BOOT_GUI] Settings saved");
 }
@@ -520,8 +546,14 @@ static void scanDiskFiles(void)
                 entry.close();
                 continue;
             }
-            if (hasExtension(name, ".dsk") || hasExtension(name, ".img")) {
-                // Store with leading slash for full path
+            // Accept the common Mac disk-image extensions used in the
+            // wild: .dsk, .img (Sony / floppy images), and .hfv (Win
+            // Basilisk II / Mini vMac). The disk backend treats any of
+            // them as raw sectors, so the file extension only gates
+            // whether the picker shows the file.
+            if (hasExtension(name, ".dsk") ||
+                hasExtension(name, ".img") ||
+                hasExtension(name, ".hfv")) {
                 std::string path = "/";
                 path += name;
                 disk_files.push_back(path);
@@ -572,7 +604,13 @@ static void scanCDROMFiles(void)
                 entry.close();
                 continue;
             }
-            if (hasExtension(name, ".iso")) {
+            // CD-ROM images: ISO 9660 .iso, Apple Disk Copy .cdr (raw
+            // sector dump used by Disk Utility), and Roxio .toast (the
+            // header is a thin wrapper but most modern .toast files in
+            // the wild are raw ISO data with the wrapper stripped).
+            if (hasExtension(name, ".iso") ||
+                hasExtension(name, ".cdr") ||
+                hasExtension(name, ".toast")) {
                 std::string path = "/";
                 path += name;
                 cdrom_files.push_back(path);
@@ -1795,15 +1833,26 @@ static void runSettingsScreen(void)
     int radio_region_w = radio_gap * 4 + 20;
     int radio_region_h = RADIO_SIZE + 30;
 
-    // Audio checkbox - below the memory group-box.
+    // Three checkboxes share a row below the Memory group-box: Audio,
+    // Boot-from-CD, and Rotate 180. Each gets ~1/3 of the main column.
     int audio_y = mem_panel_y + mem_panel_h + 20;
     int audio_x = content_x;
     int audio_checkbox_x = audio_x;
     int audio_checkbox_size = RADIO_SIZE;
     int audio_region_x = audio_x - 5;
     int audio_region_y = audio_y - 5;
-    int audio_region_w = 320;
+    int audio_region_w = main_w / 3;
     int audio_region_h = audio_checkbox_size + 20;
+
+    int bootcd_x = content_x + (main_w / 3);
+    int bootcd_y = audio_y;
+    int bootcd_checkbox_x = bootcd_x;
+    int bootcd_region_w = main_w / 3;
+
+    int rotate_x = content_x + (main_w / 3) * 2;
+    int rotate_y = audio_y;
+    int rotate_checkbox_x = rotate_x;
+    int rotate_region_w = main_w - (main_w / 3) * 2;
     
     // Debug: Print layout info
     Serial.printf("[BOOT_GUI] Layout: list_y=%d, list_h=%d, item_height=%d\n", list_y, list_h, LIST_ITEM_HEIGHT);
@@ -1828,6 +1877,8 @@ static void runSettingsScreen(void)
     int prev_extfs_selection = extfs_selection_index;
     int prev_ram_mb = selected_ram_mb;
     bool prev_audio_enabled = audio_enabled;
+    bool prev_boot_from_cd = boot_from_cd;
+    int  prev_rotation_degrees = rotation_degrees;
 
     // WiFi status polling state. We redraw the strip once per second, or
     // immediately when the underlying connection state changes, so an
@@ -1847,7 +1898,9 @@ static void runSettingsScreen(void)
     bool touch_in_wifi_btn = false;
     bool touch_in_usb_btn = false;
     bool touch_in_audio_checkbox = false;
-    
+    bool touch_in_bootcd_checkbox = false;
+    bool touch_in_rotate_checkbox = false;
+
     TouchEvent touch;
     
     while (!should_boot && !open_wifi && !open_usb) {
@@ -1856,6 +1909,8 @@ static void runSettingsScreen(void)
         bool extfs_changed = false;
         bool ram_changed = false;
         bool audio_changed = false;
+        bool bootcd_changed = false;
+        bool rotate_changed = false;
         bool boot_btn_changed = false;
         bool wifi_btn_changed = false;
         bool usb_btn_changed  = false;
@@ -1874,6 +1929,8 @@ static void runSettingsScreen(void)
                 touch_in_usb_btn = usb_available &&
                     isPointInRect(touch_start_x, touch_start_y, usb_btn_x, usb_btn_y, usb_btn_w, usb_btn_h);
                 touch_in_audio_checkbox = isPointInRect(touch_start_x, touch_start_y, audio_x, audio_y, audio_region_w, audio_checkbox_size + 10);
+                touch_in_bootcd_checkbox = isPointInRect(touch_start_x, touch_start_y, bootcd_x, bootcd_y, bootcd_region_w, audio_checkbox_size + 10);
+                touch_in_rotate_checkbox = isPointInRect(touch_start_x, touch_start_y, rotate_x, rotate_y, rotate_region_w, audio_checkbox_size + 10);
                 
                 if (touch_in_boot_btn) {
                     boot_touch_started = true;
@@ -1983,7 +2040,27 @@ static void runSettingsScreen(void)
                     audio_enabled = !audio_enabled;
                     Serial.printf("[BOOT_GUI] Audio toggled: %s\n", audio_enabled ? "enabled" : "disabled");
                 }
-                
+
+                // Boot-from-CD checkbox: only meaningful when a CD-ROM
+                // is selected; toggling without a disc is harmless and
+                // LoadPrefs will ignore it at boot.
+                if (touch_in_bootcd_checkbox) {
+                    boot_from_cd = !boot_from_cd;
+                    Serial.printf("[BOOT_GUI] Boot from CD toggled: %s\n",
+                                  boot_from_cd ? "yes" : "no");
+                }
+
+                // Rotate-180 checkbox: 0 <-> 180.
+                if (touch_in_rotate_checkbox) {
+                    if (rotation_degrees == 180) {
+                        rotation_degrees = 0;
+                    } else {
+                        rotation_degrees = 180;
+                    }
+                    Serial.printf("[BOOT_GUI] Rotation toggled: %d\n",
+                                  rotation_degrees);
+                }
+
                 // Reset touch state
                 touch_in_disk_list = false;
                 touch_in_cdrom_list = false;
@@ -1992,6 +2069,8 @@ static void runSettingsScreen(void)
                 touch_in_wifi_btn = false;
                 touch_in_usb_btn = false;
                 touch_in_audio_checkbox = false;
+                touch_in_bootcd_checkbox = false;
+                touch_in_rotate_checkbox = false;
                 boot_touch_started = false;
                 boot_pressed = false;
                 wifi_touch_started = false;
@@ -2020,6 +2099,8 @@ static void runSettingsScreen(void)
         extfs_changed = (extfs_selection_index != prev_extfs_selection);
         ram_changed = (selected_ram_mb != prev_ram_mb);
         audio_changed = (audio_enabled != prev_audio_enabled);
+        bootcd_changed = (boot_from_cd != prev_boot_from_cd);
+        rotate_changed = (rotation_degrees != prev_rotation_degrees);
         boot_btn_changed = (boot_pressed != prev_boot_pressed);
         wifi_btn_changed = (wifi_pressed != prev_wifi_pressed);
         usb_btn_changed  = (usb_pressed != prev_usb_pressed);
@@ -2058,8 +2139,12 @@ static void runSettingsScreen(void)
             drawRadioButton(radio_start_x + radio_gap * 2, ram_y, "12 MB", selected_ram_mb == 12);
             drawRadioButton(radio_start_x + radio_gap * 3, ram_y, "16 MB", selected_ram_mb == 16);
 
-            // Draw Audio checkbox
+            // Draw Audio / Boot-from-CD / Rotate checkboxes on one row.
+            // Rotate is checked when rotation == 180 (the v4.0 default,
+            // matches "USB-C port on the left" hold orientation).
             drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
+            drawCheckbox(bootcd_checkbox_x, bootcd_y, audio_checkbox_size, "Boot from CD", boot_from_cd);
+            drawCheckbox(rotate_checkbox_x, rotate_y, audio_checkbox_size, "Rotate 180", rotation_degrees == 180);
 
             // Draw buttons. Boot is the default action so it gets the
             // classic double-border halo treatment.
@@ -2113,6 +2198,20 @@ static void runSettingsScreen(void)
                              audio_region_w, audio_region_h, MAC_WHITE);
                 drawCheckbox(audio_checkbox_x, audio_y, audio_checkbox_size, "Audio", audio_enabled);
             }
+
+            if (bootcd_changed) {
+                gfx.fillRect(bootcd_x - 5, audio_region_y,
+                             bootcd_region_w, audio_region_h, MAC_WHITE);
+                drawCheckbox(bootcd_checkbox_x, bootcd_y, audio_checkbox_size,
+                             "Boot from CD", boot_from_cd);
+            }
+
+            if (rotate_changed) {
+                gfx.fillRect(rotate_x - 5, audio_region_y,
+                             rotate_region_w, audio_region_h, MAC_WHITE);
+                drawCheckbox(rotate_checkbox_x, rotate_y, audio_checkbox_size,
+                             "Rotate 180", rotation_degrees == 180);
+            }
             
             if (boot_btn_changed) {
                 drawButton(boot_btn_x, boot_btn_y, boot_btn_w, boot_btn_h, "Boot",
@@ -2135,6 +2234,8 @@ static void runSettingsScreen(void)
         prev_extfs_selection = extfs_selection_index;
         prev_ram_mb = selected_ram_mb;
         prev_audio_enabled = audio_enabled;
+        prev_boot_from_cd = boot_from_cd;
+        prev_rotation_degrees = rotation_degrees;
         prev_boot_pressed = boot_pressed;
         prev_wifi_pressed = wifi_pressed;
         prev_usb_pressed  = usb_pressed;
@@ -3396,6 +3497,16 @@ const char* BootGUI_GetWiFiPassword(void)
 bool BootGUI_GetWiFiAutoConnect(void)
 {
     return wifi_auto_connect;
+}
+
+bool BootGUI_GetBootFromCD(void)
+{
+    return boot_from_cd;
+}
+
+int BootGUI_GetRotation(void)
+{
+    return rotation_degrees;
 }
 
 bool BootGUI_GetAudioEnabled(void)

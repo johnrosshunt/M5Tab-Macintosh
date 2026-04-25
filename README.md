@@ -46,6 +46,111 @@ Both variants share the BasiliskII core, video pipeline, USB HID handling, and b
 
 ---
 
+## What's New in v4.1
+
+- **Faster SD flush + shutdown sync** — the on-card disk image is
+  now flushed every 2 seconds (down from 120 s) and again ~500 ms
+  after the guest goes idle, so a power pull during normal use
+  loses at most a couple of seconds of writes instead of two
+  minutes. Programmatic resets (`esp_restart`, panics, watchdogs)
+  also drain the buffer through an
+  `esp_register_shutdown_handler` hook in [`src/main.cpp`](src/main.cpp).
+  XPRAM saves opportunistically flush the disk too, since they
+  are a strong "the user just changed something" signal.
+- **HID report-descriptor parser** — modern USB mice that send
+  non-standard X/Y bit layouts (most current Logitech / optical
+  mice) used to hit a heuristic that mapped X bits onto Y, leaving
+  the cursor moving mostly up and down. The new parser in
+  [`src/basilisk/hid_descriptor.cpp`](src/basilisk/hid_descriptor.cpp)
+  fetches `GET_DESCRIPTOR(REPORT)` for each HID interface and
+  decodes Usage Page / X / Y / Wheel / Buttons generically. Vintage
+  boot-mode mice (the original Apple roll-ball USB mouse, etc.)
+  keep working through the existing fallback decoder. Scroll wheel
+  forwards as Mac arrow keys so scroll-aware classic-Mac apps
+  respond.
+- **Boot from CD** — the boot GUI gained a "Boot from CD" checkbox
+  next to the CD-ROM picker. When set with a CD selected,
+  [`prefs_esp32.cpp`](src/basilisk/prefs_esp32.cpp) sets
+  `bootdriver=-62` (CDROMRefNum) so the Mac boots from the ISO
+  instead of the hard disk - same effect as holding **C** at boot
+  on a real Mac. Used together with the new minimal TOC stubs in
+  [`sys_esp32.cpp`](src/basilisk/sys_esp32.cpp), Mac OS install
+  CDs that previously bailed during TOC probe now boot.
+- **Wider CD / disk file pickers** — `.cdr` and `.toast` files now
+  show up alongside `.iso` in the CD-ROM picker, and `.hfv`
+  (Win Basilisk II / Mini vMac) joins `.dsk`/`.img` in the hard
+  disk picker.
+- **Screen-rotation toggle** — a "Rotate 180" checkbox in the boot
+  GUI flips between v4.0's USB-C-on-the-left layout (default) and
+  USB-C-on-the-right. Tab5 only; the Waveshare 10.1" panel
+  orientation is fixed by the ribbon location and the toggle is a
+  no-op there. Drives both the framebuffer flip and the touch
+  coordinate transform via a new
+  `BoardDisplay_SetFlip180()` HAL entry.
+- **ExtFS auto-create + visible errors** — selecting a shared
+  folder that doesn't exist on the SD card now `mkdir`s it
+  automatically and logs the resolved path; previous silent
+  failures (case mismatch, deleted folder, etc.) are surfaced on
+  the serial console with the actual `errno`.
+- **Robust audio codec reset on every boot** — the ES8388 (Tab5)
+  and ES8311 (Waveshare) audio codecs keep their state through any
+  ESP32 reset because they have their own power rail. A crash or
+  panic mid-playback could leave the chip stuck enough that audio
+  was silent until the user pulled power. v4.1 unconditionally
+  performs a full mute + power-down + chip-reset sequence over I2C
+  before the normal codec init runs on both boards, so a soft
+  reboot now recovers audio the same as a power cycle. Logs the
+  reset reason and a post-reset register read for diagnostics.
+- **exFAT card detection** — the precompiled FatFs in pioarduino
+  is built without exFAT support (FF_FS_EXFAT=0), so a card
+  formatted as exFAT used to fail with a generic "init failed"
+  message. v4.1's `BoardSD_ProbeFilesystem()` reads sector 0
+  directly via the underlying SDSPI / SDMMC host driver after a
+  failed mount and prints a specific "Card detected, formatted as
+  exFAT — reformat as FAT32" message on the serial console so the
+  fix is obvious. The sdkconfig overrides also flip
+  `CONFIG_FATFS_USE_EXFAT=y` as future-proofing for whenever the
+  upstream framework enables it.
+
+You can edit `/basilisk_settings.txt` on the SD card directly to
+flip any of these without going through the GUI:
+`ramsize=16`, `boot_from_cd=yes`, `rotation=0`, `audio=no`, etc.
+Allowed RAM values are 4 / 8 / 12 / 16 MB; allowed rotations are
+`0` and `180`. The traditional desktop-Basilisk
+`~/.basilisk_ii_prefs` file format is *not* read by this port -
+all preferences live in `/basilisk_settings.txt`.
+
+A note on ROMs: any `.ROM` whose 16-bit version word at offset
+8 reads `0x067C` (32-bit clean Mac II family — Q650, Q800, Q900,
+Q950) or `0x0276` (Classic) will boot. The default file path is
+`/Q650.ROM` but the filename itself is arbitrary. Set
+`rom=/MyROM.ROM` in the settings file to override.
+
+### SD card formats
+
+- **FAT32** is the only fully supported format. Cards up to ~2 TB
+  partition size are fine.
+- **exFAT** is *not* mountable: the precompiled FatFs that ships
+  with pioarduino is built with `FF_FS_EXFAT=0`, so f_mount returns
+  `FR_NO_FILESYSTEM` on exFAT cards. v4.1 detects this case and
+  prints a clear message on the serial console — "Card detected,
+  formatted as exFAT. Please reformat as FAT32." — instead of the
+  generic "init failed". sdkconfig already declares
+  `CONFIG_FATFS_USE_EXFAT=y` so if upstream pioarduino flips that on
+  in a future release, this firmware will pick up exFAT support
+  with no source change.
+- **FAT32 single-file 4 GB cap** is rarely a problem in practice.
+  Mac OS HFS volumes top out at 2 GB, so even maxed-out `.dsk`
+  images fit. ISO images larger than 4 GB (mostly Mac OS X DVD
+  installers, which this firmware can't run anyway) are the one
+  realistic case where you'd want exFAT.
+- **Disk-image extensions** in the boot GUI picker: `.dsk`, `.img`,
+  `.hfv`. `.hfv` is the Win Basilisk II / Mini vMac default and is
+  treated as a raw HFS image just like `.dsk`.
+- **CD-ROM extensions**: `.iso`, `.cdr`, `.toast`.
+
+---
+
 ## What's New in v4.0
 
 - **Multi-touch on-screen keyboard** — three-finger tap anywhere on the

@@ -39,12 +39,25 @@
 #define BOARD_TILES_X               (BOARD_MAC_SCREEN_WIDTH  / BOARD_TILE_WIDTH)  /* 16 */
 #define BOARD_TILES_Y               (BOARD_MAC_SCREEN_HEIGHT / BOARD_TILE_HEIGHT) /* 9  */
 
-/* SD card on SPI (Tab5 layout documented in boardConfig.md) */
+/* SD card on SPI (Tab5 layout documented in boardConfig.md).
+ *
+ * BOARD_SD_MOUNT_POINT is the *VFS prefix* where the card is registered,
+ * which matches Arduino SD's default mountpoint (/sd). It is NOT what
+ * appears in calls like SD_FS.open("/Q650.ROM") - Arduino's File class
+ * automatically prepends its mountpoint when opening files, so app
+ * code keeps using SD-root-relative paths like "/Q650.ROM". The macro
+ * is only consumed by code that has to talk to POSIX directly (stat,
+ * mkdir, etc., e.g. ExtFS host-folder validation in prefs_esp32.cpp).
+ *
+ * Previous value of "/" was wrong - the VFS does not actually have a
+ * mount registered at "/" on Tab5, so POSIX stat("/Shared") returned
+ * ENOENT even when the card had a /Shared folder, which is what made
+ * ExtFS silently disable. */
 #define BOARD_SD_SPI_SCK            43
 #define BOARD_SD_SPI_MOSI           44
 #define BOARD_SD_SPI_MISO           39
 #define BOARD_SD_SPI_CS             42
-#define BOARD_SD_MOUNT_POINT        "/"
+#define BOARD_SD_MOUNT_POINT        "/sd"
 
 /* ------------------------------------------------------------------------- */
 /* Waveshare ESP32-P4-WIFI6-Touch-LCD-10.1                                   */

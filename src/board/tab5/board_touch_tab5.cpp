@@ -33,13 +33,20 @@ extern "C" void BoardTouch_Update(void)
      * Board_Update(), so nothing to do here. */
 }
 
-/* Map raw portrait (720x1280) to logical landscape (1280x720) with the
- * same 180-flip convention used in board_display_tab5.cpp's PushTile path:
+/* Map raw portrait (720x1280) to logical landscape (1280x720). Two
+ * orientations are supported, gated on the same flag the display HAL
+ * uses to decide whether MiniGfx flips its tile output.
+ *
+ * Rotate 180 = true (v4.0 default, USB-C port on the left):
  *   logical (lx, ly) -> portrait (px, py) = (ly, _ph - 1 - lx)
- * Inverse:
- *   lx = TAB5_PANEL_H_PORTRAIT - 1 - py
- *   ly = px
+ *   Inverse: lx = (_ph - 1) - py, ly = px
+ *
+ * Rotate 180 = false (USB-C port on the right):
+ *   logical (lx, ly) -> portrait (px, py) = (_pw - 1 - ly, lx)
+ *   Inverse: lx = py, ly = (_pw - 1) - px
  */
+extern "C" bool BoardDisplayTab5_GetFlip180(void);
+
 static inline void portrait_to_landscape(int raw_x, int raw_y, int *out_x, int *out_y)
 {
     int px = raw_x;
@@ -49,8 +56,13 @@ static inline void portrait_to_landscape(int raw_x, int raw_y, int *out_x, int *
     if (py < 0) py = 0;
     if (py >= TAB5_PANEL_H_PORTRAIT) py = TAB5_PANEL_H_PORTRAIT - 1;
 
-    *out_x = (TAB5_PANEL_H_PORTRAIT - 1) - py;
-    *out_y = px;
+    if (BoardDisplayTab5_GetFlip180()) {
+        *out_x = (TAB5_PANEL_H_PORTRAIT - 1) - py;
+        *out_y = px;
+    } else {
+        *out_x = py;
+        *out_y = (TAB5_PANEL_W_PORTRAIT - 1) - px;
+    }
 }
 
 extern "C" BoardTouchDetail BoardTouch_GetDetail(void)

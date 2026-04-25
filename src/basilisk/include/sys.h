@@ -76,4 +76,19 @@ extern void SysCDGetVolume(void *fh, uint8 &left, uint8 &right);
 // Periodic flush for sector cache - call from main loop
 extern void Sys_periodic_flush(void);
 
+// Force-flush every dirty open handle right now. Safe to call from a
+// shutdown hook or power-button handler; logs the number of handles
+// it touched so the serial console shows the sync did happen before
+// reset.
+extern void Sys_flush_now(void);
+
+// Returns true if any open handle still has un-flushed writes. Used by
+// the basilisk_loop idle-flush path so we can run a fast flush within
+// ~500 ms of the last write without thrashing the SD during heavy I/O.
+extern bool Sys_has_dirty_handles(void);
+
+// Returns the millis() timestamp of the most recent dirtying write, or
+// 0 if no writes have happened since boot. Used by the idle-flush logic.
+extern uint32_t Sys_last_write_ms(void);
+
 #endif

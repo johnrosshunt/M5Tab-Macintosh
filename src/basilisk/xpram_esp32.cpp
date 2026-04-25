@@ -6,6 +6,7 @@
 
 #include "sysdeps.h"
 #include "xpram.h"
+#include "sys.h"
 
 #include "board_sd.h"  /* SD_FS alias */
 
@@ -95,6 +96,12 @@ void SaveXPRAM(void)
         memcpy(xpram_shadow, XPRAM, XPRAM_SIZE);
         xpram_shadow_valid = true;
     }
+
+    // A PRAM change is a strong "the user just told the Mac to remember
+    // something" signal (Startup Disk, Sound volume, etc.). Take the
+    // opportunity to push any other dirty disk-image writes out too so
+    // a power pull immediately after will not lose the visible change.
+    Sys_flush_now();
 }
 
 /*

@@ -160,8 +160,22 @@ static uint32 last_xpram_flush_time = 0;
 // The video task runs at its own pace, this just triggers buffer swap
 #define VIDEO_SIGNAL_INTERVAL 49  // ~20 FPS target
 
-// Disk flush interval (ms) - how often to flush write buffer to SD card
-#define DISK_FLUSH_INTERVAL 120000  // 120 seconds
+// Disk flush interval (ms) - hard upper bound for how long a dirty
+// handle can sit before basilisk_loop() forces a flush during sustained
+// write traffic. v4.0 used 120 s which made power-pulls expensive; we
+// drop to 10 s for a 12x improvement without hammering the SD card on
+// every Mac OS catalog update during heavy I/O. The idle-flush path
+// below catches quiescent guests sooner.
+#define DISK_FLUSH_INTERVAL 10000  // 10 seconds
+
+// Idle-flush window (ms). Once Sys_write stops being called for this
+// long, basilisk_loop() runs Sys_periodic_flush() so the FAT/HFS state
+// on the card is consistent shortly after the guest goes quiet (e.g.
+// after Mac OS finishes booting or saving a file). Long enough that
+// we don't repeatedly flush during a benchmark or game that's writing
+// in bursts; short enough that the desktop converges to a clean
+// on-card state quickly.
+#define DISK_IDLE_FLUSH_MS 3000
 
 // XPRAM flush cadence (ms). SaveXPRAM() short-circuits when nothing changed,
 // so a short interval is cheap and bounds the data-loss window after a PRAM
@@ -661,9 +675,20 @@ void basilisk_loop(void)
     
     perf_loop_count++;
     
-    // Periodic disk write buffer flush (every 2 seconds)
-    // Time check done here to avoid function call overhead on every tick
-    if (current_time - last_disk_flush_time >= DISK_FLUSH_INTERVAL) {
+    // Periodic disk write buffer flush. Two triggers:
+    //   1. Hard cadence (DISK_FLUSH_INTERVAL) bounds the loss window
+    //      under sustained write traffic.
+    //   2. Idle-flush: once writes stop for DISK_IDLE_FLUSH_MS the loop
+    //      pushes any remaining dirty handles immediately, so a quiet
+    //      guest (e.g. sitting at the desktop) is fully synced.
+    bool flush_due = (current_time - last_disk_flush_time >= DISK_FLUSH_INTERVAL);
+    if (!flush_due && Sys_has_dirty_handles()) {
+        uint32_t last_w = Sys_last_write_ms();
+        if (last_w != 0 && (current_time - last_w) >= DISK_IDLE_FLUSH_MS) {
+            flush_due = true;
+        }
+    }
+    if (flush_due) {
         last_disk_flush_time = current_time;
         uint32 t0 = micros();
         Sys_periodic_flush();

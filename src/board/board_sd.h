@@ -4,8 +4,11 @@
  * Both boards put the microSD card on the same set of GPIOs (39-44), but
  * the Tab5 firmware drives it in SPI mode while the Waveshare BSP uses
  * SDMMC 4-bit mode. BoardSD_Init() hides the difference; after it returns
- * the card is mounted at BOARD_SD_MOUNT_POINT ("/" on Tab5, "/sd" on
- * Waveshare) and the existing Arduino SD.* or POSIX VFS APIs work as-is.
+ * the card is mounted at BOARD_SD_MOUNT_POINT ("/sd" on both boards) and
+ * the existing Arduino SD.* or POSIX VFS APIs work as-is. App code that
+ * uses Arduino's SD_FS.open("/Q650.ROM") still uses SD-root-relative
+ * paths because Arduino's File class transparently prepends the VFS
+ * mountpoint internally.
  */
 #pragma once
 

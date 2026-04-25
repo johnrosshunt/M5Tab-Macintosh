@@ -34,12 +34,25 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "hid_descriptor.h"
+
 #ifndef USB_INTERFACE_DESC
 #define USB_INTERFACE_DESC 0x04
 #endif
 #ifndef USB_ENDPOINT_DESC
 #define USB_ENDPOINT_DESC 0x05
 #endif
+/* HID class descriptors per HID 1.11 §7.1: 0x21 = HID, 0x22 = Report. */
+#ifndef USB_HID_DESC_TYPE
+#define USB_HID_DESC_TYPE        0x21
+#endif
+#ifndef USB_HID_REPORT_DESC_TYPE
+#define USB_HID_REPORT_DESC_TYPE 0x22
+#endif
+
+/* Maximum HID report descriptor we will accept. Real-world mice top out
+ * around 100-200 bytes; allocate a comfortable upper bound. */
+#define HID_REPORT_DESC_MAX_BYTES 512
 
 #define DEBUG 0
 #include "debug.h"
@@ -321,6 +334,13 @@ struct UsbDeviceSlot {
     uint8_t interval;
     bool ready;
     unsigned long last_poll;
+
+    /* Parsed HID mouse layout (X/Y/Wheel/Buttons bit map). Populated
+     * asynchronously by handleNewDevice -> kickHidReportRead(). Stays
+     * { .valid = false } if parsing failed or the device isn't a
+     * mouse, in which case processMouseReport() falls back to its
+     * heuristic byte-layout decoder. */
+    HidMouseLayout mouse_layout;
 };
 
 // Forward declarations
@@ -425,7 +445,8 @@ static void processKeyboardReport(hid_keyboard_report_t *report,
 // Mouse Input Processing (with Mac OS 8 right-click -> Control+Click)
 // ============================================================================
 
-static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_info) {
+static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_info,
+                               const HidMouseLayout *layout) {
     if (ep_info->bInterfaceClass != USB_CLASS_HID) return;
     if (ep_info->bInterfaceProtocol == HID_ITF_PROTOCOL_KEYBOARD) return;
     if (transfer->actual_num_bytes < 3) return;
@@ -435,27 +456,47 @@ static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_
     uint8_t buttons = 0;
     int16_t dx = 0;
     int16_t dy = 0;
+    int16_t dw = 0;
 
-    // Logitech MX Master and similar mice: Report ID 0x02, 16-bit movement
-    if (transfer->actual_num_bytes >= 7 && transfer->data_buffer[0] == 0x02) {
-        buttons = transfer->data_buffer[1];
-        dx = (int16_t)(transfer->data_buffer[3] | (transfer->data_buffer[4] << 8));
-        dy = (int16_t)(transfer->data_buffer[5] | (transfer->data_buffer[6] << 8));
-    } else if (transfer->actual_num_bytes >= 4 && transfer->data_buffer[0] <= 0x07) {
-        // Standard boot protocol: buttons, X, Y, wheel
-        buttons = transfer->data_buffer[0];
-        dx = (int8_t)transfer->data_buffer[1];
-        dy = (int8_t)transfer->data_buffer[2];
-    } else if (transfer->actual_num_bytes >= 5) {
-        // Report ID format: ReportID, buttons, X, Y
-        buttons = transfer->data_buffer[1];
-        dx = (int8_t)transfer->data_buffer[2];
-        dy = (int8_t)transfer->data_buffer[3];
-    } else {
-        // Fallback: assume boot protocol
-        buttons = transfer->data_buffer[0];
-        dx = (int8_t)transfer->data_buffer[1];
-        dy = (int8_t)transfer->data_buffer[2];
+    /* Preferred path: parsed HID report descriptor. The parser ran
+     * asynchronously after device enumeration; if it succeeded, the
+     * layout knows exactly where X/Y/Wheel/Buttons live regardless of
+     * whether the device is in boot or report protocol or uses a
+     * Report ID prefix. The heuristic decoder below stays as a
+     * fallback for vintage boot-mode mice and devices whose report
+     * descriptor is unusual enough that the parser bails. */
+    bool layout_decoded = false;
+    if (layout != NULL && layout->valid) {
+        layout_decoded = HidDecodeMouseReport(transfer->data_buffer,
+                                              transfer->actual_num_bytes,
+                                              layout, &buttons, &dx, &dy, &dw);
+    }
+
+    if (!layout_decoded) {
+        // Logitech MX Master and similar mice: Report ID 0x02, 16-bit movement
+        if (transfer->actual_num_bytes >= 7 && transfer->data_buffer[0] == 0x02) {
+            buttons = transfer->data_buffer[1];
+            dx = (int16_t)(transfer->data_buffer[3] | (transfer->data_buffer[4] << 8));
+            dy = (int16_t)(transfer->data_buffer[5] | (transfer->data_buffer[6] << 8));
+        } else if (transfer->actual_num_bytes >= 4 && transfer->data_buffer[0] <= 0x07) {
+            // Standard boot protocol: buttons, X, Y, wheel
+            buttons = transfer->data_buffer[0];
+            dx = (int8_t)transfer->data_buffer[1];
+            dy = (int8_t)transfer->data_buffer[2];
+            if (transfer->actual_num_bytes >= 4) {
+                dw = (int8_t)transfer->data_buffer[3];
+            }
+        } else if (transfer->actual_num_bytes >= 5) {
+            // Report ID format: ReportID, buttons, X, Y
+            buttons = transfer->data_buffer[1];
+            dx = (int8_t)transfer->data_buffer[2];
+            dy = (int8_t)transfer->data_buffer[3];
+        } else {
+            // Fallback: assume boot protocol
+            buttons = transfer->data_buffer[0];
+            dx = (int8_t)transfer->data_buffer[1];
+            dy = (int8_t)transfer->data_buffer[2];
+        }
     }
 
     uint8_t old_buttons = usb_mouse_buttons;
@@ -504,6 +545,31 @@ static void processMouseReport(const usb_transfer_t *transfer, EndpointInfo *ep_
     if (dx != 0 || dy != 0) {
         ADBSetRelMouseMode(true);
         ADBMouseMoved(dx, dy);
+    }
+
+    /* Forward scroll wheel as Mac arrow keys. Classic Mac OS doesn't
+     * emulate ADB scroll natively (it pre-dates the wheel), so we
+     * drive arrow-up/arrow-down keystrokes per wheel detent. Most
+     * scroll-aware apps from the era (Netscape, IE 5, scrollable
+     * dialogs) handle that fine; games can ignore. We rate-limit to
+     * one keystroke per wheel detent rather than streaming so a
+     * single notch produces one arrow press. */
+    if (dw != 0) {
+        const uint8_t mac_arrow_up   = 0x7E;
+        const uint8_t mac_arrow_down = 0x7D;
+        int16_t notches = dw;
+        if (notches > 4)  notches = 4;
+        if (notches < -4) notches = -4;
+        while (notches > 0) {
+            ADBKeyDown(mac_arrow_up);
+            ADBKeyUp(mac_arrow_up);
+            notches--;
+        }
+        while (notches < 0) {
+            ADBKeyDown(mac_arrow_down);
+            ADBKeyUp(mac_arrow_down);
+            notches++;
+        }
     }
 }
 
@@ -755,7 +821,16 @@ private:
         uint8_t cur_intf_class = 0;
         uint8_t cur_intf_subclass = 0;
         uint8_t cur_intf_protocol = 0;
+        uint8_t cur_intf_number = 0;
         bool cur_intf_claimed = false;
+        bool cur_intf_is_mouse = false;
+
+        /* If we find a HID class descriptor for the mouse interface,
+         * remember its number and the report-descriptor length so we
+         * can fetch it after enumeration completes. */
+        bool     mouse_hid_found  = false;
+        uint8_t  mouse_intf_num   = 0;
+        uint16_t mouse_rdesc_len  = 0;
 
         for (int i = 0; i < config_desc->wTotalLength; i += bLength, p += bLength) {
             bLength = *p;
@@ -768,7 +843,9 @@ private:
                 cur_intf_class = intf->bInterfaceClass;
                 cur_intf_subclass = intf->bInterfaceSubClass;
                 cur_intf_protocol = intf->bInterfaceProtocol;
+                cur_intf_number = intf->bInterfaceNumber;
                 cur_intf_claimed = false;
+                cur_intf_is_mouse = false;
 
                 if (cur_intf_class == USB_CLASS_HID) {
                     esp_err_t err = usb_host_interface_claim(
@@ -783,7 +860,26 @@ private:
                             dev->has_keyboard = true;
                         } else {
                             dev->has_mouse = true;
+                            cur_intf_is_mouse = true;
                         }
+                    }
+                }
+
+            } else if (bDescriptorType == USB_HID_DESC_TYPE && cur_intf_claimed) {
+                /* HID class descriptor: 9 bytes minimum.
+                 *   bLength, bDescriptorType, bcdHID(2), bCountryCode,
+                 *   bNumDescriptors, bDescriptorType_subord(=0x22 Report),
+                 *   wDescriptorLength(2)
+                 * We only consume the first subordinate descriptor entry,
+                 * which is the standard layout for ~all mice. */
+                if (bLength >= 9 && cur_intf_is_mouse && !mouse_hid_found) {
+                    uint8_t  sub_type = p[6];
+                    uint16_t sub_len  = (uint16_t)p[7] | ((uint16_t)p[8] << 8);
+                    if (sub_type == USB_HID_REPORT_DESC_TYPE && sub_len > 0 &&
+                        sub_len <= HID_REPORT_DESC_MAX_BYTES) {
+                        mouse_hid_found = true;
+                        mouse_intf_num  = cur_intf_number;
+                        mouse_rdesc_len = sub_len;
                     }
                 }
 
@@ -820,6 +916,106 @@ private:
                 }
             }
         }
+
+        /* If we found a mouse HID interface and recorded its report-
+         * descriptor length, fire off a control transfer to fetch the
+         * descriptor. The completion callback will parse it into
+         * dev->mouse_layout. Until that lands, processMouseReport()
+         * uses its existing heuristic decoder. */
+        if (mouse_hid_found && mouse_rdesc_len > 0) {
+            kickHidReportRead(slot, mouse_intf_num, mouse_rdesc_len);
+        }
+    }
+
+    /*
+     * Issue GET_DESCRIPTOR(REPORT) on the device's default control
+     * endpoint. The transfer buffer has 8 bytes of setup packet
+     * followed by the requested wLength of data; on completion the
+     * callback parses bytes [8 .. 8+wLength) as the report descriptor.
+     */
+    void kickHidReportRead(int slot, uint8_t intf_num, uint16_t length) {
+        UsbDeviceSlot *dev = &devices[slot];
+        if (dev->handle == NULL) return;
+
+        usb_transfer_t *xfer = NULL;
+        esp_err_t err = usb_host_transfer_alloc(8 + length, 0, &xfer);
+        if (err != ESP_OK || xfer == NULL) {
+            Serial.printf("[USB] HID descriptor alloc failed: 0x%x\n", err);
+            return;
+        }
+
+        xfer->num_bytes = 8 + length;
+        xfer->data_buffer[0] = 0x81;  /* bmRequestType: D->H, Standard, Interface */
+        xfer->data_buffer[1] = 0x06;  /* GET_DESCRIPTOR */
+        xfer->data_buffer[2] = 0x00;  /* wValue low: descriptor index 0 */
+        xfer->data_buffer[3] = USB_HID_REPORT_DESC_TYPE;  /* wValue high: Report */
+        xfer->data_buffer[4] = intf_num;
+        xfer->data_buffer[5] = 0x00;
+        xfer->data_buffer[6] = (uint8_t)(length & 0xFF);
+        xfer->data_buffer[7] = (uint8_t)((length >> 8) & 0xFF);
+
+        xfer->device_handle = dev->handle;
+        xfer->bEndpointAddress = 0x00;  /* default control pipe */
+        xfer->callback = hidReportDescCallback;
+        /* Pack slot index into the context so the callback knows which
+         * device this came from. */
+        xfer->context = (void *)(uintptr_t)slot;
+
+        err = usb_host_transfer_submit_control(clientHandle, xfer);
+        if (err != ESP_OK) {
+            Serial.printf("[USB] HID descriptor submit failed: 0x%x\n", err);
+            usb_host_transfer_free(xfer);
+        }
+    }
+
+    static void hidReportDescCallback(usb_transfer_t *transfer) {
+        if (!usbHost) {
+            usb_host_transfer_free(transfer);
+            return;
+        }
+        uint8_t slot = (uint8_t)(uintptr_t)transfer->context;
+        if (slot >= MAX_USB_DEVICES) {
+            usb_host_transfer_free(transfer);
+            return;
+        }
+        UsbDeviceSlot *dev = &usbHost->devices[slot];
+
+        do {
+            if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+                Serial.printf("[USB] HID descriptor transfer status=%d\n",
+                              transfer->status);
+                break;
+            }
+            if (transfer->actual_num_bytes <= 8) {
+                Serial.println("[USB] HID descriptor: no payload");
+                break;
+            }
+            if (!dev->active) {
+                break;
+            }
+
+            const uint8_t *desc = transfer->data_buffer + 8;
+            size_t desc_len = transfer->actual_num_bytes - 8;
+
+            HidMouseLayout layout;
+            bool ok = HidParseMouseDescriptor(desc, desc_len, &layout);
+            if (ok) {
+                dev->mouse_layout = layout;
+                Serial.printf("[HID] parsed report desc: btns=%d x=%d%c y=%d%c "
+                              "wheel=%d%c report_id=%u bytes=%u\n",
+                              layout.button_count,
+                              layout.x_size_bits, layout.x_signed ? 's' : 'u',
+                              layout.y_size_bits, layout.y_signed ? 's' : 'u',
+                              layout.has_wheel ? layout.wheel_size_bits : 0,
+                              (layout.has_wheel && layout.wheel_signed) ? 's' : 'u',
+                              layout.report_id,
+                              layout.report_bytes);
+            } else {
+                Serial.println("[HID] report desc parse failed - falling back to heuristics");
+            }
+        } while (0);
+
+        usb_host_transfer_free(transfer);
     }
 
     static void transferCallback(usb_transfer_t *transfer) {
@@ -861,7 +1057,7 @@ private:
 
         } else if (ep_info->bInterfaceClass == USB_CLASS_HID &&
                    ep_info->bInterfaceProtocol != HID_ITF_PROTOCOL_KEYBOARD) {
-            processMouseReport(transfer, ep_info);
+            processMouseReport(transfer, ep_info, &dev->mouse_layout);
         }
     }
 };

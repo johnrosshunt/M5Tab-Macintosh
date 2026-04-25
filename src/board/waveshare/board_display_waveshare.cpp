@@ -253,6 +253,14 @@ extern "C" void BoardDisplay_SetBacklight(int percent)
     bsp_display_brightness_set(percent);
 }
 
+/* Waveshare 10.1" panel orientation is fixed by the ribbon location;
+ * accept the request but do nothing so the boot GUI's Rotate-180
+ * toggle is a harmless no-op on this board. */
+extern "C" void BoardDisplay_SetFlip180(bool flip)
+{
+    (void)flip;
+}
+
 MiniGfx &BoardDisplay_Gfx_Board(void)
 {
     return s_gfx;

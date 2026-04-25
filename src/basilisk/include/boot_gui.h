@@ -87,8 +87,8 @@ const char* BootGUI_GetCDROMPath(void);
  *  Get the selected shared-folder path for ExtFS.
  *
  *  The returned string is SD-root-relative (e.g. "/Shared"). Callers that
- *  need a VFS path must prepend BOARD_SD_MOUNT_POINT ("/" on Tab5, "/sd"
- *  on Waveshare) themselves.
+ *  need a VFS path must prepend BOARD_SD_MOUNT_POINT ("/sd" on both Tab5
+ *  and Waveshare with the v4.1 mount fix) themselves.
  *
  *  Returns an empty string if the user picked "None" / disabled ExtFS.
  */
@@ -131,6 +131,21 @@ bool BootGUI_GetWiFiAutoConnect(void);
  *  Returns true if emulator audio should be enabled
  */
 bool BootGUI_GetAudioEnabled(void);
+
+/*
+ *  Returns true if the user asked to boot from the selected CD-ROM
+ *  ("Boot from CD" checkbox). Only meaningful when GetCDROMPath() is
+ *  non-empty; LoadPrefs() ignores it otherwise.
+ */
+bool BootGUI_GetBootFromCD(void);
+
+/*
+ *  Returns the selected display rotation: 0 (default landscape) or
+ *  180 (flipped). Used by the Tab5 board HAL to set the MiniGfx flip
+ *  flag and the touch transform; the Waveshare HAL ignores it for
+ *  now (the 10.1" panel orientation is fixed by the ribbon location).
+ */
+int BootGUI_GetRotation(void);
 
 /*
  *  Check if WiFi is currently connected
